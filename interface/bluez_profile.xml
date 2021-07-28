@@ -1,0 +1,18 @@
+<node>
+    <interface name="org.bluez.Profile1">
+        <method name="Release">
+            <annotation
+                name="org.freedesktop.DBus.Method.NoReply"
+                value="true"/>
+        </method>
+        <method name="NewConnection">
+            <arg name="device" type="o" direction="in"/>
+            <annotation name="org.gtk.GDBus.C.UnixFD" value="true"/>
+            <arg name="fd" type="h" direction="in"/>
+            <arg name="fd_properties" type="a{sv}" direction="in"/>
+        </method>
+        <method name="RequestDisconnection">
+            <arg name="device" type="o" direction="in"/>
+        </method>
+    </interface>
+</node>

@@ -1,0 +1,73 @@
+<!--
+mdrd - MDR daemon
+
+ Copyright (C) 2021 Andreas Olofsson
+
+
+This file is part of mdrd.
+
+mdrd is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+mdr is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with mdrd. If not, see <https://www.gnu.org/licenses/>.
+-->
+
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+    <interface name="org.mdr.Device">
+        <property name="name" type="s" access="read"/>
+    </interface>
+    <interface name="org.mdr.Battery">
+        <property name="level" type="u" access="read"/>
+        <property name="charging" type="b" access="read"/>
+    </interface>
+    <interface name="org.mdr.LeftRightBattery">
+        <property name="left_level" type="u" access="read"/>
+        <property name="right_level" type="u" access="read"/>
+        <property name="left_charging" type="b" access="read"/>
+        <property name="right_charging" type="b" access="read"/>
+    </interface>
+    <interface name="org.mdr.CradleBattery">
+        <property name="level" type="u" access="read"/>
+        <property name="charging" type="b" access="read"/>
+    </interface>
+    <interface name="org.mdr.NoiseCancelling">
+        <property name="enabled" type="b" access="read"/>
+        <method name="Enable"></method>
+        <method name="Disable"></method>
+    </interface>
+    <interface name="org.mdr.AmbientSoundMode">
+        <property name="amount" type="u" access="read"/>
+        <property name="mode" type="s" access="read"/>
+        <method name="SetAmount">
+            <arg name="amount" type="u" direction="in"/>
+        </method>
+        <method name="SetMode">
+            <arg name="name" type="s" direction="in"/>
+        </method>
+    </interface>
+    <interface name="org.mdr.Eq">
+        <property name="band_count" type="u" access="read"/>
+        <property name="level_steps" type="u" access="read"/>
+
+        <property name="available_presets" type="as" access="read"/>
+        <property name="preset" type="s" access="read"/>
+        <method name="SetPreset">
+            <arg name="preset" type="s" direction="in"/>
+        </method>
+
+        <property name="levels" type="au" access="read"/>
+        <method name="SetLevels">
+            <arg name="levels" type="au" direction="in"/>
+        </method>
+    </interface>
+</node>
