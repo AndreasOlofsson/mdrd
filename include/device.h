@@ -32,9 +32,9 @@ typedef struct device device_t;
 typedef void (*device_created_cb)(void* user_data);
 typedef void (*device_create_error_cb)(void* user_data);
 
-void devices_init();
+void devices_init(void);
 
-void devices_deinit();
+void devices_deinit(void);
 
 void device_add(const gchar* name,
                 gint sock,

@@ -36,6 +36,10 @@ along with mdrd. If not, see <https://www.gnu.org/licenses/>.
         <property name="left_charging" type="b" access="read"/>
         <property name="right_charging" type="b" access="read"/>
     </interface>
+    <interface name="org.mdr.LeftRight">
+        <property name="left_connected" type="b" access="read"/>
+        <property name="right_connected" type="b" access="read"/>
+    </interface>
     <interface name="org.mdr.CradleBattery">
         <property name="level" type="u" access="read"/>
         <property name="charging" type="b" access="read"/>

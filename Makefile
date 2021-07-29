@@ -48,8 +48,12 @@ $(BUILD_DIR)/%.o: $(GENERATED_DIR)/%.c | $(BUILD_DIR)
 $(GENERATED_DIR)/%.c: $(INTERFACE_DIR)/%.xml | $(GENERATED_DIR)
 	gdbus-codegen $< --generate-c-code $(patsubst %.c,%,$@)
 
-$(LIBMDR):
+$(LIBMDR): .FORCE
 	cd $(LIBMDR_DIR) && make
+
+.FORCE:
+
+.PHONY: all clean
 
 $(BUILD_DIR):
 	mkdir -p $@

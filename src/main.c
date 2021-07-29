@@ -76,6 +76,8 @@ int main(int argc, char *argv[])
 
     g_main_loop_unref(loop);
 
+    g_dbus_connection_close_sync(connection, NULL, NULL);
+
     devices_deinit();
 
     return 0;

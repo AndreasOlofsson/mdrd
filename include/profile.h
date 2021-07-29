@@ -25,13 +25,13 @@
 
 #include <gio/gio.h>
 
-void profile_init();
+void profile_init(void);
 
-void profile_deinit();
+void profile_deinit(void);
 
-void profile_register();
+void profile_register(void);
 
-void profile_unregister();
+void profile_unregister(void);
 
 #endif /* __PROFILE_H__ */
 

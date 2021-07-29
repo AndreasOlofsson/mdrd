@@ -27,109 +27,41 @@
 
 #include <signal.h>
 
-typedef struct device_source device_source_t;
-
 extern GDBusConnection* connection;
 
-GHashTable* device_table;
-
-typedef struct device device_t;
-
-typedef struct
-{
-    device_t* device;
-    mdr_packet_battery_inquired_type_t type;
-}
-battery_update_callback_data_t;
+typedef struct device_source device_source_t;
 
 struct device
 {
-    int refs;
-
-    gchar* dbus_name;
-
+    int ref_count;
+    const gchar* dbus_name;
     mdr_device_t* mdr_device;
 
     device_source_t* source;
 
-    guint battery_timer;
     OrgMdrDevice* device_iface;
     OrgMdrBattery* battery_iface;
-    OrgMdrLeftRightBattery* lr_battery_iface;
+    OrgMdrLeftRightBattery* left_right_battery_iface;
     OrgMdrCradleBattery* cradle_battery_iface;
-    OrgMdrNoiseCancelling* nc_iface;
-    OrgMdrAmbientSoundMode* asm_iface;
-    OrgMdrEq* eq_iface;
-
-    battery_update_callback_data_t* battery_cb_data;
-    battery_update_callback_data_t* lr_battery_cb_data;
-    battery_update_callback_data_t* cradle_battery_cb_data;
-
-    mdr_packet_ncasm_inquired_type_t ncasm_type;
+    OrgMdrLeftRight* left_right_iface;
 };
 
-static void device_destroy(device_t* device);
+GHashTable* device_table;
 
-static void device_ref(device_t* device)
-{
-    device->refs++;
-}
+static void device_removed(device_t* device);
 
-static void device_unref(device_t* device)
-{
-    device->refs--;
-    if (device->refs == 0)
-    {
-        device_destroy(device);
-    }
-}
+static void device_ref(device_t* device);
+
+static void device_unref(device_t* device);
 
 struct device_source
 {
     GSource source;
-    device_t* device;
     GPollFD poll_fd;
+    device_t* device;
 };
 
-static gboolean device_source_prepare(GSource*, gint* timeout);
-static gboolean device_source_check(GSource*);
-static gboolean device_source_dispatch(GSource*, GSourceFunc, gpointer);
-
-static GSourceFuncs device_source_funcs = {
-    .prepare = device_source_prepare,
-    .check = device_source_check,
-    .dispatch = device_source_dispatch,
-};
-
-static void device_removed(device_t*);
-static gboolean device_update_batteries(void* user_data);
-static void device_fetch_name(device_t* device);
-static void device_ncasm_notify(void*, device_t* device);
-static void device_eq_init(device_t* device);
-
-static gboolean on_ncasm_disable(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        device_t* device);
-
-static gboolean on_ncasm_enable(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        device_t* device);
-
-static gboolean on_ncasm_set_asm_amount(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        guint amount,
-        device_t* device);
-
-static gboolean on_ncasm_set_asm_mode(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        const guchar* mode,
-        device_t* device);
-
-void devices_init()
+void devices_init(void)
 {
     device_table = g_hash_table_new_full(
             g_str_hash,
@@ -138,7 +70,7 @@ void devices_init()
             (void (*)(void*)) device_removed);
 }
 
-void devices_deinit()
+void devices_deinit(void)
 {
     g_hash_table_destroy(device_table);
 }
@@ -146,439 +78,632 @@ void devices_deinit()
 typedef struct
 {
     device_t* device;
-    gchar* dbus_name;
+
     device_created_cb success_cb;
     device_create_error_cb error_cb;
     void* user_data;
 }
-device_finish_data_t;
+device_add_init_data;
 
-static void device_add_finish(void* data, void* user_data);
-static void device_add_error(void* user_data);
+static gboolean device_source_prepare(GSource*, gint* timeout);
+static gboolean device_source_check(GSource*);
+static gboolean device_source_dispatch(GSource*, GSourceFunc, gpointer);
 
-void device_add(const gchar* dbus_name,
+static void device_source_dispose(GSource* source);
+
+static GSourceFuncs device_source_funcs = {
+    .prepare = device_source_prepare,
+    .check = device_source_check,
+    .dispatch = device_source_dispatch,
+};
+
+static void device_add_init_success(void* user_data);
+
+static void device_add_init_error(void* user_data);
+
+void device_add(const gchar* name,
                 gint sock,
                 device_created_cb success_cb,
                 device_create_error_cb error_cb,
                 void* user_data)
 {
-    device_finish_data_t* call_data = malloc(sizeof(device_finish_data_t));
-    if (call_data == NULL)
-    {
-        error_cb(user_data);
-        return;
-    }
-
     device_t* device = malloc(sizeof(device_t));
     if (device == NULL)
     {
-        free(call_data);
         error_cb(user_data);
         return;
     }
-    device->refs = 1;
-
-    device->dbus_name = g_strdup(dbus_name);
-    device->battery_timer = -1;
-    device->device_iface = NULL;
-    device->battery_iface = NULL;
-    device->lr_battery_iface = NULL;
-    device->cradle_battery_iface = NULL;
-    device->nc_iface = NULL;
-    device->asm_iface = NULL;
-    device->eq_iface = NULL;
-
-    device->mdr_device = mdr_device_new_from_sock(sock);
-    if (device->mdr_device == NULL)
+    device_add_init_data* init_data = malloc(sizeof(device_add_init_data));
+    if (init_data == NULL)
     {
-        free(call_data);
         free(device);
         error_cb(user_data);
         return;
     }
 
-    device_source_t* dev_source =
-        (device_source_t*) g_source_new(&device_source_funcs,
-                                        sizeof(device_source_t));
-    dev_source->poll_fd.fd = sock;
-    dev_source->poll_fd.events = G_IO_IN | G_IO_OUT | G_IO_HUP | G_IO_ERR;
-    dev_source->poll_fd.revents = 0;
-    g_source_add_poll(&dev_source->source, &dev_source->poll_fd);
+    mdr_device_t* mdr_device = mdr_device_new_from_sock(sock);
+    if (mdr_device == NULL)
+    {
+        error_cb(user_data);
+        return;
+    }
 
+    g_debug("Connected to MDR device '%s'", name);
+
+    device->ref_count = 2; // Initialization/table + source
+    device->dbus_name = g_strdup(name);
+    device->mdr_device = mdr_device;
+
+    device->battery_iface = NULL;
+    device->left_right_battery_iface = NULL;
+    device->cradle_battery_iface = NULL;
+    device->left_right_iface = NULL;
+
+    init_data->device = device;
+
+    init_data->success_cb = success_cb;
+    init_data->error_cb = error_cb;
+    init_data->user_data = user_data;
+
+    mdr_device_init(mdr_device,
+                    device_add_init_success,
+                    device_add_init_error,
+                    init_data);
+
+    device_source_t* dev_source =
+            (device_source_t*) g_source_new(&device_source_funcs,
+                                            sizeof(device_source_t));
+    dev_source->poll_fd.fd = sock;
+    dev_source->poll_fd.events = G_IO_IN | G_IO_OUT | G_IO_ERR | G_IO_HUP;
+    dev_source->poll_fd.revents = 0;
     dev_source->device = device;
+
     device->source = dev_source;
 
+    g_source_set_dispose_function(&dev_source->source, device_source_dispose);
+
+    g_source_add_poll(&dev_source->source, &dev_source->poll_fd);
+
     g_source_attach(&dev_source->source, g_main_context_default());
-
-    call_data->device = device;
-    call_data->dbus_name = g_strdup(dbus_name);
-    call_data->success_cb = success_cb;
-    call_data->error_cb = error_cb;
-    call_data->user_data = user_data;
-
-    mdr_device_get_support_functions(
-            device->mdr_device,
-            device_add_finish,
-            device_add_error,
-            call_data);
+    // TODO add source destory func
 }
 
-static void device_add_finish(void* data, void* user_data)
+static void device_add_init_name_success(uint8_t len,
+                                         const uint8_t* name,
+                                         void* user_data);
+
+static void device_add_init_success(void* user_data)
 {
-    mdr_packet_connect_ret_support_function_t* supported_functions = data;
-    device_finish_data_t* call_data = user_data;
+    device_add_init_data* init_data = user_data;
+    device_t* device = init_data->device;
 
-    device_t* device = call_data->device;
+    g_debug("Device '%s' initialized", device->dbus_name);
 
-    bool support_ncasm = mdr_packet_support_function_contains(
-            supported_functions,
-            MDR_PACKET_SUPPORT_FUNCTION_TYPE_NOISE_CANCELLING_AND_AMBIENT_SOUND_MODE);
+    mdr_device_get_model_name(
+            device->mdr_device,
+            device_add_init_name_success,
+            device_add_init_error,
+            user_data);
+}
 
-    bool support_nc = support_ncasm
-        || mdr_packet_support_function_contains(
-            supported_functions,
-            MDR_PACKET_SUPPORT_FUNCTION_TYPE_NOISE_CANCELLING);
+static void device_init_battery(device_t*);
+static void device_init_left_right_battery(device_t*);
+static void device_init_cradle_battery(device_t*);
+static void device_init_left_right_connection_status(device_t*);
 
-    bool support_asm = support_ncasm
-        || mdr_packet_support_function_contains(
-            supported_functions,
-            MDR_PACKET_SUPPORT_FUNCTION_TYPE_AMBIENT_SOUND_MODE);
+static void device_add_init_name_success(uint8_t len,
+                                         const uint8_t* name,
+                                         void* user_data)
+{
+    device_add_init_data* init_data = user_data;
+    device_t* device = init_data->device;
 
-    bool support_battery =
-        mdr_packet_support_function_contains(
-                supported_functions,
-                MDR_PACKET_SUPPORT_FUNCTION_TYPE_BATTERY_LEVEL);
+    g_debug("Got name for device '%s'", device->dbus_name);
 
-    bool support_lr_battery =
-        mdr_packet_support_function_contains(
-                supported_functions,
-                MDR_PACKET_SUPPORT_FUNCTION_TYPE_LEFT_RIGHT_BATTERY_LEVEL);
+    device->device_iface = org_mdr_device_skeleton_new();
 
-    bool support_cradle_battery =
-        mdr_packet_support_function_contains(
-                supported_functions,
-                MDR_PACKET_SUPPORT_FUNCTION_TYPE_CRADLE_BATTERY_LEVEL);
+    GError* error = NULL;
 
-    bool support_eq =
-        mdr_packet_support_function_contains(
-                supported_functions,
-                MDR_PACKET_SUPPORT_FUNCTION_TYPE_PRESET_EQ);
-
-    free(supported_functions->function_types);
-    free(supported_functions);
-
-    device_fetch_name(device);
-
-    if (support_eq)
+    if (g_dbus_interface_skeleton_export(
+            G_DBUS_INTERFACE_SKELETON(device->device_iface),
+            connection,
+            device->dbus_name,
+            &error))
     {
-        device_eq_init(device);
-    }
+        org_mdr_device_set_name(
+                device->device_iface,
+                g_strndup((gchar*) name, len));
 
-    g_message("Successfully connected to device '%s'. ", call_data->dbus_name);
-
-    if (support_nc && support_asm)
-    {
-        device->ncasm_type = MDR_PACKET_NCASM_INQUIRED_TYPE_NOISE_CANCELLING_AND_ASM;
-    }
-    else if (support_nc)
-    {
-        device->ncasm_type = MDR_PACKET_NCASM_INQUIRED_TYPE_NOISE_CANCELLING;
-    }
-    else if (support_asm)
-    {
-        device->ncasm_type = MDR_PACKET_NCASM_INQUIRED_TYPE_ASM;
-    }
-
-    if (support_nc)
-    {
-        device->nc_iface = org_mdr_noise_cancelling_skeleton_new();
-
-        GError* error = NULL;
-
-        if (g_dbus_interface_skeleton_export(
-                    G_DBUS_INTERFACE_SKELETON(device->nc_iface),
-                    connection,
-                    call_data->dbus_name,
-                    &error))
-        {
-            g_signal_connect(
-                    device->nc_iface,
-                    "handle-disable",
-                     G_CALLBACK(on_ncasm_disable),
-                     device);
-
-            g_signal_connect(
-                    device->nc_iface,
-                    "handle-enable",
-                     G_CALLBACK(on_ncasm_enable),
-                     device);
-
-            g_debug("Registered noise cancelling interface. ");
-        }
-        else
-        {
-            g_error("Failed to register noise cancelling interface: "
-                    "%s", error->message);
-            device->nc_iface = NULL;
-        }
-    }
-
-    if (support_asm)
-    {
-        device->asm_iface = org_mdr_ambient_sound_mode_skeleton_new();
-
-        GError* error = NULL;
-
-        if (g_dbus_interface_skeleton_export(
-                    G_DBUS_INTERFACE_SKELETON(device->asm_iface),
-                    connection,
-                    call_data->dbus_name,
-                    &error))
-        {
-            g_signal_connect(
-                    device->asm_iface,
-                    "handle-set-amount",
-                     G_CALLBACK(on_ncasm_set_asm_amount),
-                     device);
-
-            g_signal_connect(
-                    device->asm_iface,
-                    "handle-set-mode",
-                     G_CALLBACK(on_ncasm_set_asm_mode),
-                     device);
-
-            g_debug("Registered ambient sound mode interface. ");
-        }
-        else
-        {
-            g_error("Failed to register ambient sound mode interface: "
-                    "%s", error->message);
-            device->asm_iface = NULL;
-        }
-    }
-
-    if (support_nc || support_asm)
-    {
-        mdr_device_ncasm_subscribe(
-                device->mdr_device,
-                device->ncasm_type,
-                (void (*)(void*, void*)) device_ncasm_notify,
-                device);
-
-        mdr_device_get_ncasm_param(
-                device->mdr_device,
-                device->ncasm_type,
-                (void (*)(void*, void*)) device_ncasm_notify,
-                NULL,
-                device);
-    }
-
-    if (support_battery)
-    {
-        device->battery_iface = org_mdr_battery_skeleton_new();
-
-        GError* error = NULL;
-
-        if (g_dbus_interface_skeleton_export(
-                G_DBUS_INTERFACE_SKELETON(device->battery_iface),
-                connection,
-                call_data->dbus_name,
-                &error))
-        {
-            device->battery_cb_data =
-                g_malloc(sizeof(battery_update_callback_data_t));
-
-            device->battery_cb_data->device = device;
-            device->battery_cb_data->type =
-                MDR_PACKET_BATTERY_INQUIRED_TYPE_BATTERY;
-
-            g_debug("Registered battery interface. ");
-        }
-        else
-        {
-            g_error("Failed to register battery interface: "
-                    "%s", error->message);
-            device->battery_iface = NULL;
-        }
-    }
-
-    if (support_lr_battery)
-    {
-        g_debug("Supports left-right battery.");
-
-        device->lr_battery_iface = org_mdr_left_right_battery_skeleton_new();
-
-        GError* error = NULL;
-
-        if (g_dbus_interface_skeleton_export(
-                G_DBUS_INTERFACE_SKELETON(device->lr_battery_iface),
-                connection,
-                call_data->dbus_name,
-                &error))
-        {
-            device->lr_battery_cb_data =
-                g_malloc(sizeof(battery_update_callback_data_t));
-
-            device->lr_battery_cb_data->device = device;
-            device->lr_battery_cb_data->type =
-                MDR_PACKET_BATTERY_INQUIRED_TYPE_LEFT_RIGHT_BATTERY;
-
-            g_debug("Registered left-right battery interface. ");
-        }
-        else
-        {
-            g_error("Failed to register left-right battery interface: "
-                    "%s", error->message);
-            device->lr_battery_iface = NULL;
-        }
-    }
-
-    if (support_cradle_battery)
-    {
-        g_debug("Supports cradle battery.");
-
-        device->cradle_battery_iface = org_mdr_cradle_battery_skeleton_new();
-
-        GError* error = NULL;
-
-        if (g_dbus_interface_skeleton_export(
-                G_DBUS_INTERFACE_SKELETON(device->cradle_battery_iface),
-                connection,
-                call_data->dbus_name,
-                &error))
-        {
-            device->cradle_battery_cb_data =
-                g_malloc(sizeof(battery_update_callback_data_t));
-
-            device->cradle_battery_cb_data->device = device;
-            device->cradle_battery_cb_data->type =
-                MDR_PACKET_BATTERY_INQUIRED_TYPE_CRADLE_BATTERY;
-
-            g_debug("Registered cradle battery interface. ");
-        }
-        else
-        {
-            g_error("Failed to register cradle battery interface: "
-                    "%s", error->message);
-        }
-    }
-
-    if (support_battery || support_lr_battery || support_cradle_battery)
-    {
-        device_update_batteries(device);
-        device->battery_timer = g_timeout_add(10000,
-                                              device_update_batteries,
-                                              device);
+        g_debug("Registered device interface for '%s'", device->dbus_name);
     }
     else
     {
-        device->battery_timer = -1;
+        g_warning("Failed to register device interface: "
+                  "%s", error->message);
+        
+        init_data->error_cb(init_data->user_data);
+
+        // TODO cleanup device
+
+        return;
     }
 
-    g_hash_table_insert(device_table, call_data->dbus_name, device);
+    g_hash_table_insert(device_table, g_strdup(device->dbus_name), device);
 
-    call_data->success_cb(call_data->user_data);
-    free(call_data);
+    init_data->success_cb(init_data->user_data);
+    free(init_data);
+
+    mdr_device_supported_functions_t supported_functions
+            = mdr_device_get_supported_functions(device->mdr_device);
+
+    if (supported_functions.battery)
+        device_init_battery(device);
+
+    if (supported_functions.left_right_battery)
+        device_init_left_right_battery(device);
+
+    if (supported_functions.left_right_connection_status)
+        device_init_left_right_connection_status(device);
+
+    if (supported_functions.cradle_battery)
+        device_init_cradle_battery(device);
 }
 
-static void device_add_error(void* user_data)
+static void device_init_battery_success(uint8_t level,
+                                        bool charging,
+                                        void* user_data);
+
+static void device_init_battery_error(void* user_data);
+
+static void device_init_battery(device_t* device)
 {
-    device_finish_data_t* call_data = user_data;
-
-    g_warning("Failed to connect to device '%s' (%d). ",
-              call_data->dbus_name,
-              errno);
-
-    g_free(call_data->dbus_name);
-
-    device_unref(call_data->device);
-
-    call_data->error_cb(call_data->user_data);
-    free(call_data->device);
-    free(call_data);
+    if (mdr_device_get_battery_level(
+            device->mdr_device,
+            device_init_battery_success,
+            device_init_battery_error,
+            device) < 0)
+    {
+        g_warning("Device init battery failed: %d", errno);
+    }
+    else
+    {
+        device_ref(device);
+    }
 }
 
-void device_remove(const gchar* device)
+static void device_init_battery_error(void* user_data)
 {
-    g_hash_table_remove(device_table, device);
+    device_t* device = user_data;
+
+    g_warning("Device init battery failed: %d", errno);
+    
+    device_unref(device);
+}
+
+static void device_battery_update(uint8_t level,
+                                  bool charging,
+                                  void* user_data);
+
+static void device_init_battery_success(uint8_t level,
+                                        bool charging,
+                                        void* user_data)
+{
+    device_t* device = user_data;
+
+    device->battery_iface = org_mdr_battery_skeleton_new();
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+            G_DBUS_INTERFACE_SKELETON(device->battery_iface),
+            connection,
+            device->dbus_name,
+            &error))
+    {
+        org_mdr_battery_set_level(device->battery_iface, level);
+        org_mdr_battery_set_charging(device->battery_iface, charging);
+
+        g_debug("Registered battery interface for '%s'", device->dbus_name);
+
+        mdr_device_subscribe_battery_level(
+                device->mdr_device,
+                device_battery_update,
+                device);
+    }
+    else
+    {
+        g_warning("Failed to register battery interface: "
+                  "%s", error->message);
+    }
+
+    device_unref(device);
+}
+
+static void device_battery_update(uint8_t level,
+                                  bool charging,
+                                  void* user_data)
+{
+    device_t* device = user_data;
+
+    if (device->battery_iface != NULL)
+    {
+        org_mdr_battery_set_level(device->battery_iface, level);
+        org_mdr_battery_set_charging(device->battery_iface, charging);
+    }
+}
+
+static void device_init_left_right_battery_success(uint8_t left_level,
+                                                   bool left_charging,
+                                                   uint8_t right_level,
+                                                   bool right_charging,
+                                                   void* user_data);
+
+static void device_init_left_right_battery_error(void* user_data);
+
+static void device_init_left_right_battery(device_t* device)
+{
+    if (mdr_device_get_left_right_battery_level(
+            device->mdr_device,
+            device_init_left_right_battery_success,
+            device_init_left_right_battery_error,
+            device) < 0)
+    {
+        g_warning("Device init left-right battery failed: %d", errno);
+    }
+    else
+    {
+        device_ref(device);
+    }
+}
+
+static void device_init_left_right_battery_error(void* user_data)
+{
+    device_t* device = user_data;
+
+    g_warning("Device init left-right battery failed: %d", errno);
+    
+    device_unref(device);
+}
+
+static void device_left_right_battery_update(uint8_t left_level,
+                                             bool left_charging,
+                                             uint8_t right_level,
+                                             bool right_charging,
+                                             void* user_data);
+
+static void device_init_left_right_battery_success(uint8_t left_level,
+                                                   bool left_charging,
+                                                   uint8_t right_level,
+                                                   bool right_charging,
+                                                   void* user_data)
+{
+    device_t* device = user_data;
+
+    device->left_right_battery_iface
+        = org_mdr_left_right_battery_skeleton_new();
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+            G_DBUS_INTERFACE_SKELETON(device->left_right_battery_iface),
+            connection,
+            device->dbus_name,
+            &error))
+    {
+        org_mdr_left_right_battery_set_left_level(
+                device->left_right_battery_iface,
+                left_level);
+        org_mdr_left_right_battery_set_right_level(
+                device->left_right_battery_iface,
+                right_level);
+        org_mdr_left_right_battery_set_left_charging(
+                device->left_right_battery_iface,
+                left_charging);
+        org_mdr_left_right_battery_set_right_charging(
+                device->left_right_battery_iface,
+                right_charging);
+
+        g_debug("Registered left-right battery interface for '%s'",
+                device->dbus_name);
+
+        mdr_device_subscribe_left_right_battery_level(
+                device->mdr_device,
+                device_left_right_battery_update,
+                device);
+    }
+    else
+    {
+        g_warning("Failed to register left-right battery interface: "
+                  "%s", error->message);
+    }
+
+    device_unref(device);
+}
+
+static void device_left_right_battery_update(uint8_t left_level,
+                                             bool left_charging,
+                                             uint8_t right_level,
+                                             bool right_charging,
+                                             void* user_data)
+{
+    device_t* device = user_data;
+
+    if (device->left_right_battery_iface != NULL)
+    {
+        org_mdr_left_right_battery_set_left_level(
+                device->left_right_battery_iface,
+                left_level);
+        org_mdr_left_right_battery_set_right_level(
+                device->left_right_battery_iface,
+                right_level);
+        org_mdr_left_right_battery_set_left_charging(
+                device->left_right_battery_iface,
+                left_charging);
+        org_mdr_left_right_battery_set_right_charging(
+                device->left_right_battery_iface,
+                right_charging);
+    }
+}
+
+static void device_init_cradle_battery_success(uint8_t level,
+                                               bool charging,
+                                               void* user_data);
+
+static void device_init_cradle_battery_error(void* user_data);
+
+static void device_init_cradle_battery(device_t* device)
+{
+    if (mdr_device_get_cradle_battery_level(
+            device->mdr_device,
+            device_init_cradle_battery_success,
+            device_init_cradle_battery_error,
+            device) < 0)
+    {
+        g_warning("Device init cradle battery failed: %d", errno);
+    }
+    else
+    {
+        device_ref(device);
+    }
+}
+
+static void device_init_cradle_battery_error(void* user_data)
+{
+    device_t* device = user_data;
+
+    g_warning("Device init cradle battery failed: %d", errno);
+    
+    device_unref(device);
+}
+
+static void device_cradle_battery_update(uint8_t level,
+                                  bool charging,
+                                  void* user_data);
+
+static void device_init_cradle_battery_success(uint8_t level,
+                                               bool charging,
+                                               void* user_data)
+{
+    device_t* device = user_data;
+
+    device->cradle_battery_iface = org_mdr_cradle_battery_skeleton_new();
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+            G_DBUS_INTERFACE_SKELETON(device->cradle_battery_iface),
+            connection,
+            device->dbus_name,
+            &error))
+    {
+        org_mdr_cradle_battery_set_level(device->cradle_battery_iface, level);
+        org_mdr_cradle_battery_set_charging(device->cradle_battery_iface,
+                                            charging);
+
+        g_debug("Registered cradle battery interface for '%s'", device->dbus_name);
+
+        mdr_device_subscribe_cradle_battery_level(
+                device->mdr_device,
+                device_cradle_battery_update,
+                device);
+    }
+    else
+    {
+        g_warning("Failed to register cradle battery interface: "
+                  "%s", error->message);
+    }
+
+    device_unref(device);
+}
+
+static void device_cradle_battery_update(uint8_t level,
+                                         bool charging,
+                                         void* user_data)
+{
+    device_t* device = user_data;
+
+    if (device->cradle_battery_iface != NULL)
+    {
+        org_mdr_cradle_battery_set_level(device->cradle_battery_iface, level);
+        org_mdr_cradle_battery_set_charging(device->cradle_battery_iface,
+                                            charging);
+    }
+}
+
+static void device_init_left_right_connection_status_success(
+        bool left_connected,
+        bool right_connected,
+        void* user_data);
+
+static void device_init_left_right_connection_status_error(void* user_data);
+
+static void device_init_left_right_connection_status(device_t* device)
+{
+    if (mdr_device_get_left_right_connection_status(
+            device->mdr_device,
+            device_init_left_right_connection_status_success,
+            device_init_left_right_connection_status_error,
+            device) < 0)
+    {
+        g_warning("Device init left-right connection status failed: %d", errno);
+    }
+    else
+    {
+        device_ref(device);
+    }
+}
+
+static void device_init_left_right_connection_status_error(void* user_data)
+{
+    device_t* device = user_data;
+
+    g_warning("Device init left-right connection status failed: %d", errno);
+    
+    device_unref(device);
+}
+
+static void device_left_right_connection_status_update(bool left_connected,
+                                                       bool right_connected,
+                                                       void* user_data);
+
+static void device_init_left_right_connection_status_success(
+        bool left_connected,
+        bool right_connected,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    device->left_right_iface = org_mdr_left_right_skeleton_new();
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+            G_DBUS_INTERFACE_SKELETON(device->left_right_iface),
+            connection,
+            device->dbus_name,
+            &error))
+    {
+        org_mdr_left_right_set_left_connected(device->left_right_iface,
+                                              left_connected);
+        org_mdr_left_right_set_right_connected(device->left_right_iface,
+                                               right_connected);
+
+        g_debug("Registered left-right interface for '%s'", device->dbus_name);
+
+        mdr_device_subscribe_left_right_connection_status(
+                device->mdr_device,
+                device_left_right_connection_status_update,
+                device);
+    }
+    else
+    {
+        g_warning("Failed to register left-right interface: "
+                  "%s", error->message);
+    }
+
+    device_unref(device);
+}
+
+static void device_left_right_connection_status_update(bool left_connected,
+                                                       bool right_connected,
+                                                       void* user_data)
+{
+    device_t* device = user_data;
+
+    if (device->left_right_iface != NULL)
+    {
+        org_mdr_left_right_set_left_connected(device->left_right_iface,
+                                              left_connected);
+        org_mdr_left_right_set_right_connected(device->left_right_iface,
+                                               right_connected);
+    }
+}
+
+
+static void device_add_init_error(void* user_data)
+{
+    device_add_init_data* init_data = user_data;
+
+    init_data->error_cb(init_data->error_cb);
+}
+
+void device_remove(const gchar* name)
+{
+    g_hash_table_remove(device_table, name);
 }
 
 static void device_removed(device_t* device)
 {
-    if (device->battery_timer != -1)
-    {
-        g_source_remove(device->battery_timer);
-        device->battery_timer = -1;
-    }
-
     mdr_device_close(device->mdr_device);
     device->mdr_device = NULL;
+
+    g_source_destroy(&device->source->source);
+    g_source_unref(&device->source->source);
+
     device_unref(device);
 }
 
-static void device_destroy(device_t* device)
+static void device_ref(device_t* device)
 {
-    if (device->refs != 0)
-    {
-        g_error("device_destroy called with non-zero ref count");
-        raise(SIGTRAP);
-    }
+    device->ref_count++;
 
-    g_message("Device '%s' removed\n", device->dbus_name);
-    g_free(device->dbus_name);
+    g_debug("Ref %d", device->ref_count);
+}
 
-    g_source_destroy(&device->source->source);
-    if (device->battery_timer != -1)
-    {
-        g_source_remove(device->battery_timer);
-    }
+/*
+ * Called when a device is removed from the device table.
+ *
+ * Should destroy any DBus interfaces and free the device.
+ */
+static void device_unref(device_t* device)
+{
+    device->ref_count--;
 
-    if (device->device_iface != NULL)
+    g_debug("Unref %d", device->ref_count);
+
+    if (device->ref_count <= 0)
     {
+        org_mdr_device_set_name(device->device_iface, "");
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->device_iface));
+
         g_dbus_interface_skeleton_unexport_from_connection(
                 G_DBUS_INTERFACE_SKELETON(device->device_iface),
                 connection);
-    }
+        g_object_unref(device->device_iface);
 
-    if (device->battery_iface != NULL)
-    {
-        g_dbus_interface_skeleton_unexport_from_connection(
-                G_DBUS_INTERFACE_SKELETON(device->battery_iface),
-                connection);
-        g_free(device->battery_cb_data);
-    }
+        if (device->battery_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->battery_iface),
+                    connection);
+            g_object_unref(device->battery_iface);
+        }
 
-    if (device->lr_battery_iface != NULL)
-    {
-        g_dbus_interface_skeleton_unexport_from_connection(
-                G_DBUS_INTERFACE_SKELETON(device->lr_battery_iface),
-                connection);
-        g_free(device->lr_battery_cb_data);
-    }
+        if (device->left_right_battery_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->left_right_battery_iface),
+                    connection);
+            g_object_unref(device->left_right_battery_iface);
+        }
 
-    if (device->cradle_battery_iface != NULL)
-    {
-        g_dbus_interface_skeleton_unexport_from_connection(
-                G_DBUS_INTERFACE_SKELETON(device->cradle_battery_iface),
-                connection);
-        g_free(device->cradle_battery_cb_data);
-    }
+        if (device->cradle_battery_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->cradle_battery_iface),
+                    connection);
+            g_object_unref(device->cradle_battery_iface);
+        }
 
-    if (device->nc_iface != NULL)
-    {
-        g_dbus_interface_skeleton_unexport_from_connection(
-                G_DBUS_INTERFACE_SKELETON(device->nc_iface),
-                connection);
+        if (device->left_right_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->left_right_iface),
+                    connection);
+            g_object_unref(device->left_right_iface);
+        }
     }
-
-    if (device->asm_iface != NULL)
-    {
-        g_dbus_interface_skeleton_unexport_from_connection(
-                G_DBUS_INTERFACE_SKELETON(device->asm_iface),
-                connection);
-    }
-
-    free(device);
 }
 
 static gboolean device_source_prepare(GSource* source, gint* timeout)
@@ -590,8 +715,14 @@ static gboolean device_source_prepare(GSource* source, gint* timeout)
         return FALSE;
     }
 
-    *timeout = mdr_device_wait_timeout(dev_source->device->mdr_device);
-    if (*timeout == 0)
+    mdr_poll_info poll_info = mdr_device_poll_info(dev_source->device->mdr_device);
+    *timeout = poll_info.timeout;
+    dev_source->poll_fd.events
+        = dev_source->poll_fd.events & ~G_IO_OUT
+        | (poll_info.write ? G_IO_OUT : 0);
+    dev_source->poll_fd.revents = 0;
+
+    if (poll_info.timeout == 0)
     {
         return TRUE;
     }
@@ -607,7 +738,7 @@ static gboolean device_source_check(GSource* source)
 }
 
 static gboolean device_source_dispatch(GSource* source,
-                                       GSourceFunc cb,
+                                       GSourceFunc callback,
                                        gpointer user_data)
 {
     device_source_t* dev_source = (device_source_t*) source;
@@ -621,10 +752,11 @@ static gboolean device_source_dispatch(GSource* source,
     }
 
     // TOOD handle error
-    if ((poll_fd->revents & (G_IO_ERR | G_IO_HUP)) != 0)
+    if ((poll_fd->revents & G_IO_HUP) != 0)
     {
-        g_warning("Lost connection to device '%s'",
-                  dev_source->device->dbus_name);
+        g_warning("Lost connection to device '%s': %s",
+                dev_source->device->dbus_name,
+                poll_fd->revents & G_IO_ERR ? "ERR" : "HUP");
         device_remove(dev_source->device->dbus_name);
         return G_SOURCE_REMOVE;
     }
@@ -634,709 +766,17 @@ static gboolean device_source_dispatch(GSource* source,
             (poll_fd->revents & G_IO_IN) != 0,
             (poll_fd->revents & G_IO_OUT) != 0);
 
-    poll_fd->events =
-            (mdr_device_waiting_read(mdr_device) ? G_IO_IN : 0)
-         | (mdr_device_waiting_write(mdr_device) ? G_IO_OUT : 0)
-         | G_IO_HUP | G_IO_ERR;
-    dev_source->poll_fd.revents = 0;
-
-    if (cb != NULL)
+    if (callback != NULL)
     {
-        cb(user_data);
+        callback(user_data);
     }
 
     return G_SOURCE_CONTINUE;
 }
 
-static void device_fetch_name_result(void*, void*);
-static void device_fetch_name_error(void*);
-
-static void device_fetch_name(device_t* device)
+static void device_source_dispose(GSource* source)
 {
-    device_ref(device);
-    mdr_device_get_device_info(
-            device->mdr_device,
-            MDR_PACKET_DEVICE_INFO_INQUIRED_TYPE_MODEL_NAME,
-            device_fetch_name_result,
-            device_fetch_name_error,
-            device);
-}
+    device_source_t* dev_source = (device_source_t*) source;
 
-static void device_fetch_name_result(void* data, void* user_data)
-{
-    mdr_packet_device_info_string_t* name = data;
-    device_t* device = user_data;
-
-    device->device_iface = org_mdr_device_skeleton_new();
-
-    GError* error = NULL;
-
-    if (g_dbus_interface_skeleton_export(
-            G_DBUS_INTERFACE_SKELETON(device->device_iface),
-            connection,
-            device->dbus_name,
-            &error))
-    {
-        org_mdr_device_set_name(device->device_iface,
-                g_strndup((gchar*) name->string, name->len));
-
-        g_debug("Registered device interface. ");
-    }
-    else
-    {
-        g_warning("Failed to register device interface: "
-                  "%s", error->message);
-    }
-
-    free(name->string);
-    free(name);
-
-    device_unref(device);
-}
-
-static void device_fetch_name_error(void* user_data)
-{
-    device_t* device = user_data;
-
-    g_warning("Failed to fetch device name (%d). ", errno);
-    
-    device_unref(device);
-}
-
-static const gchar* get_preset_name(mdr_packet_eqebb_eq_preset_id_t);
-static mdr_packet_eqebb_eq_preset_id_t get_preset_id(const gchar* name);
-
-static void device_eq_cap_result(mdr_packet_eqebb_capability_eq_t*, device_t*);
-static void device_eq_cap_error(device_t*);
-
-static void device_eq_init(device_t* device)
-{
-    device_ref(device);
-    mdr_device_get_eqebb_capability(
-            device->mdr_device,
-            MDR_PACKET_EQEBB_INQUIRED_TYPE_PRESET_EQ,
-            MDR_PACKET_EQEBB_DISPLAY_LANGUAGE_UNDEFINED_LANGUAGE,
-            (void (*)(void*, void*)) device_eq_cap_result,
-            (void (*)(void*)) device_eq_cap_error,
-            device);
-}
-
-static void device_eq_cap_error(device_t* device)
-{
-    g_warning("Failed to get EQ presets for device '%s'.", device->dbus_name);
-    device_unref(device);
-}
-
-static void device_eq_param_result(mdr_packet_eqebb_param_eq_t*, device_t*);
-static void device_eq_param_error(device_t*);
-
-static void device_eq_cap_result(mdr_packet_eqebb_capability_eq_t* caps,
-                                 device_t* device)
-{
-    device->eq_iface = org_mdr_eq_skeleton_new();
-
-    org_mdr_eq_set_band_count(device->eq_iface, caps->band_count);
-    org_mdr_eq_set_level_steps(device->eq_iface, caps->level_steps);
-
-    const gchar** presets = g_new(const gchar*, caps->num_presets + 1);
-    int j = 0;
-    for (int i = 0; i < caps->num_presets; i++)
-    {
-        const gchar* name = get_preset_name(caps->presets[i].preset_id);
-
-        if (name != NULL)
-        {
-            presets[j] = g_strdup(name);
-            j++;
-        }
-
-        free(caps->presets[i].name);
-    }
-    presets[j] = NULL;
-    org_mdr_eq_set_available_presets(device->eq_iface, presets);
-
-    free(caps->presets);
-    free(caps);
-
-    mdr_device_get_eqebb_param(
-            device->mdr_device,
-            MDR_PACKET_EQEBB_INQUIRED_TYPE_PRESET_EQ,
-            (void (*)(void*, void*)) device_eq_param_result,
-            (void (*)(void*)) device_eq_param_error,
-            device);
-}
-
-static gboolean on_eq_set_preset(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        const gchar* preset,
-        device_t* device);
-
-static gboolean on_eq_set_levels(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        GVariant* levels,
-        device_t* device);
-
-static void device_eq_param_result(mdr_packet_eqebb_param_eq_t* eq_param,
-                                   device_t* device)
-{
-    const gchar* preset_name = get_preset_name(eq_param->preset_id);
-
-    if (preset_name != NULL)
-    {
-        org_mdr_eq_set_preset(device->eq_iface, g_strdup(preset_name));
-    }
-
-    GVariantBuilder* levels = g_variant_builder_new(G_VARIANT_TYPE("au"));
-
-    for (int i = 0; i < eq_param->num_levels; i++)
-    {
-        g_variant_builder_add(levels, "u", (guint32) eq_param->levels[i]);
-    }
-
-    org_mdr_eq_set_levels(device->eq_iface, g_variant_builder_end(levels));
-
-    GError* error = NULL;
-
-    if (g_dbus_interface_skeleton_export(
-            G_DBUS_INTERFACE_SKELETON(device->eq_iface),
-            connection,
-            device->dbus_name,
-            &error))
-    {
-        g_signal_connect(
-                device->eq_iface,
-                "handle-set-preset",
-                 G_CALLBACK(on_eq_set_preset),
-                 device);
-
-        g_signal_connect(
-                device->eq_iface,
-                "handle-set-levels",
-                 G_CALLBACK(on_eq_set_levels),
-                 device);
-
-        g_debug("Registered EQ interface. ");
-    }
-    else
-    {
-        g_warning("Failed to register EQ interface: "
-                  "%s", error->message);
-    }
-
-    device_unref(device);
-}
-
-static void device_eq_param_error(device_t* device)
-{
-    g_warning("Failed to get EQ param for device '%s'.", device->dbus_name);
-
-    // TODO destroy interface
-
-    device_unref(device);
-}
-
-static void on_eq_set_preset_success(void*, GDBusMethodInvocation* invocation);
-static void on_eq_set_preset_error(GDBusMethodInvocation* invocation);
-
-static gboolean on_eq_set_preset(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        const gchar* preset_name,
-        device_t* device)
-{
-    mdr_packet_eqebb_eq_preset_id_t preset = get_preset_id(preset_name);
-    
-    if (preset == MDR_PACKET_EQEBB_EQ_PRESET_ID_UNSPECIFIED)
-    {
-        g_dbus_method_invocation_return_dbus_error(invocation,
-                "org.mdr.UnknownPreset",
-                "Unknown EQ preset. ");
-    }
-    else
-    {
-        mdr_device_set_eq_preset(device->mdr_device,
-                preset,
-                (void (*)(void*, void*)) on_eq_set_preset_success,
-                (void (*)(void*)) on_eq_set_preset_error,
-                invocation);
-    }
-
-    return TRUE;
-}
-
-static void on_eq_set_preset_success(void* _, GDBusMethodInvocation* invocation)
-{
-    g_dbus_method_invocation_return_value(invocation, g_variant_new("()"));
-}
-
-static void on_eq_set_preset_error(GDBusMethodInvocation* invocation)
-{
-    g_dbus_method_invocation_return_dbus_error(invocation,
-            "org.mdr.Failed",
-            "Failed to set EQ preset. ");
-}
-
-static void on_eq_set_levels_success(void*, GDBusMethodInvocation* invocation);
-static void on_eq_set_levels_error(GDBusMethodInvocation* invocation);
-
-static gboolean on_eq_set_levels(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        GVariant* levels,
-        device_t* device)
-{
-    gsize num_levels = g_variant_n_children(levels);
-
-    if (num_levels != org_mdr_eq_get_band_count(device->eq_iface))
-    {
-        g_dbus_method_invocation_return_dbus_error(invocation,
-                "org.mdr.BadBandCount",
-                "Bad EQ band count. ");
-
-        return TRUE;
-    }
-
-    guint32 level_max = org_mdr_eq_get_level_steps(device->eq_iface);
-
-    uint8_t* mdr_levels = g_new(uint8_t, num_levels);
-    for (int i = 0; i < num_levels; i++)
-    {
-        guint32 level;
-        g_variant_get_child(levels, i, "u", &level); 
-
-        if (level > level_max)
-        {
-            free(mdr_levels);
-
-            g_dbus_method_invocation_return_dbus_error(invocation,
-                    "org.mdr.InvalidLevel",
-                    "Invalid EQ level. ");
-
-            return TRUE;
-        }
-
-        mdr_levels[i] = level;
-    }
-
-    mdr_device_set_eq_levels(device->mdr_device,
-            num_levels,
-            mdr_levels,
-            (void (*)(void*, void*)) on_eq_set_levels_success,
-            (void (*)(void*)) on_eq_set_levels_error,
-            invocation);
-
-    g_free(mdr_levels);
-
-    return TRUE;
-}
-
-static void on_eq_set_levels_success(void* _, GDBusMethodInvocation* invocation)
-{
-    g_dbus_method_invocation_return_value(invocation, g_variant_new("()"));
-}
-
-static void on_eq_set_levels_error(GDBusMethodInvocation* invocation)
-{
-    g_dbus_method_invocation_return_dbus_error(invocation,
-            "org.mdr.Failed",
-            "Failed to set EQ levels. ");
-}
-
-static const gchar* get_preset_name(mdr_packet_eqebb_eq_preset_id_t preset)
-{
-    switch (preset)
-    {
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_OFF:
-            return "Off"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_ROCK:
-            return "Rock"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_POP:
-            return "Pop"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_JAZZ:
-            return "Jazz"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_DANCE:
-            return "Dance"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_EDM:
-            return "EDM"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_R_AND_B_HIP_HOP:
-            return "R6B Hip Hop"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_ACOUSTIC:
-            return "Acoustic"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_BRIGHT:
-            return "Bright"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_EXCITED:
-            return "Excited"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_MELLOW:
-            return "Mellow"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_RELAXED:
-            return "Relaxed"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_VOCAL:
-            return "Vocal"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_TREBLE:
-            return "Treble"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_BASS:
-            return "Bass"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_SPEECH:
-            return "Speech"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_CUSTOM:
-            return "Custom"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING1:
-            return "User Setting 1"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING2:
-            return "User Setting 2"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING3:
-            return "User Setting 3"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING4:
-            return "User Setting 4"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING5:
-            return "User Setting 5"; break;
-        case MDR_PACKET_EQEBB_EQ_PRESET_ID_UNSPECIFIED:
-            return "Unspecified"; break;
-        default:
-            return NULL;
-    }
-}
-
-static mdr_packet_eqebb_eq_preset_id_t get_preset_id(const gchar* name)
-{
-    if (g_str_equal(name, "Off"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_OFF;
-    else if (g_str_equal(name, "Rock"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_ROCK;
-    else if (g_str_equal(name, "Pop"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_POP;
-    else if (g_str_equal(name, "Jazz"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_JAZZ;
-    else if (g_str_equal(name, "Dance"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_DANCE;
-    else if (g_str_equal(name, "EDM"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_EDM;
-    else if (g_str_equal(name, "R6B Hip Hop"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_R_AND_B_HIP_HOP;
-    else if (g_str_equal(name, "Acoustic"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_ACOUSTIC;
-    else if (g_str_equal(name, "Bright"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_BRIGHT;
-    else if (g_str_equal(name, "Excited"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_EXCITED;
-    else if (g_str_equal(name, "Mellow"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_MELLOW;
-    else if (g_str_equal(name, "Relaxed"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_RELAXED;
-    else if (g_str_equal(name, "Vocal"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_VOCAL;
-    else if (g_str_equal(name, "Treble"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_TREBLE;
-    else if (g_str_equal(name, "Bass"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_BASS;
-    else if (g_str_equal(name, "Speech"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_SPEECH;
-    else if (g_str_equal(name, "Custom"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_CUSTOM;
-    else if (g_str_equal(name, "User Setting 1"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING1;
-    else if (g_str_equal(name, "User Setting 2"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING2;
-    else if (g_str_equal(name, "User Setting 3"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING3;
-    else if (g_str_equal(name, "User Setting 4"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING4;
-    else if (g_str_equal(name, "User Setting 5"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_USER_SETTING5;
-    else if (g_str_equal(name, "Unspecified"))
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_UNSPECIFIED;
-    else
-        return MDR_PACKET_EQEBB_EQ_PRESET_ID_UNSPECIFIED;
-}
-
-static void device_update_batteries_success(void* result, void* user_data);
-static void device_update_batteries_error(void* user_data);
-
-static gboolean device_update_batteries(void* user_data)
-{
-    device_t* device = user_data;
-
-    if (device->battery_iface != NULL)
-    {
-        device_ref(device);
-        mdr_device_get_battery_level(
-                device->mdr_device,
-                MDR_PACKET_BATTERY_INQUIRED_TYPE_BATTERY,
-                device_update_batteries_success,
-                device_update_batteries_error,
-                device->battery_cb_data);
-    }
-
-    if (device->lr_battery_iface != NULL)
-    {
-        device_ref(device);
-        mdr_device_get_battery_level(
-                device->mdr_device,
-                MDR_PACKET_BATTERY_INQUIRED_TYPE_LEFT_RIGHT_BATTERY,
-                device_update_batteries_success,
-                device_update_batteries_error,
-                device->lr_battery_cb_data);
-    }
-
-    if (device->cradle_battery_iface != NULL)
-    {
-        device_ref(device);
-        mdr_device_get_battery_level(
-                device->mdr_device,
-                MDR_PACKET_BATTERY_INQUIRED_TYPE_CRADLE_BATTERY,
-                device_update_batteries_success,
-                device_update_batteries_error,
-                device->cradle_battery_cb_data);
-    }
-
-    return TRUE;
-}
-
-static void device_update_batteries_success(void* result, void* user_data)
-{
-    battery_update_callback_data_t* callback_data = user_data;
-    device_t* device = callback_data->device;
-
-    switch (callback_data->type)
-    {
-        case MDR_PACKET_BATTERY_INQUIRED_TYPE_BATTERY:
-        {
-            mdr_packet_battery_status_t* battery_status = result;
-
-            org_mdr_battery_set_level(
-                    device->battery_iface,
-                    battery_status->level);
-            org_mdr_battery_set_charging(
-                    device->battery_iface,
-                    battery_status->charging != 0);
-
-            free(battery_status);
-        }
-        break;
-
-        case MDR_PACKET_BATTERY_INQUIRED_TYPE_LEFT_RIGHT_BATTERY:
-        {
-            mdr_packet_battery_status_left_right_t* battery_status = result;
-
-            org_mdr_left_right_battery_set_left_level(
-                    device->lr_battery_iface,
-                    battery_status->left.level);
-            org_mdr_left_right_battery_set_left_charging(
-                    device->lr_battery_iface,
-                    battery_status->left.charging != 0);
-            org_mdr_left_right_battery_set_right_level(
-                    device->lr_battery_iface,
-                    battery_status->right.level);
-            org_mdr_left_right_battery_set_right_charging(
-                    device->lr_battery_iface,
-                    battery_status->right.charging != 0);
-
-            free(battery_status);
-        }
-        break;
-
-        case MDR_PACKET_BATTERY_INQUIRED_TYPE_CRADLE_BATTERY:
-        {
-            mdr_packet_battery_status_t* battery_status = result;
-
-            org_mdr_cradle_battery_set_level(
-                    device->cradle_battery_iface,
-                    battery_status->level);
-            org_mdr_cradle_battery_set_charging(
-                    device->cradle_battery_iface,
-                    battery_status->charging != 0);
-
-            free(battery_status);
-        }
-        break;
-    }
-
-    device_unref(device);
-}
-
-static void device_update_batteries_error(void* user_data)
-{
-    battery_update_callback_data_t* callback_data = user_data;
-    device_t* device = callback_data->device;
-
-    g_warning("Failed to update batteries for device '%s'\n", device->dbus_name);
-
-    device_unref(device);
-}
-
-static void device_ncasm_notify(void* data, device_t* device)
-{
-    g_debug("Got NCASM data");
-
-    switch (device->ncasm_type)
-    {
-        case MDR_PACKET_NCASM_INQUIRED_TYPE_NOISE_CANCELLING:
-        {
-            mdr_packet_ncasm_param_noise_cancelling_t* param = data;
-
-            if (param->nc_setting_type ==
-                    MDR_PACKET_NCASM_NC_SETTING_TYPE_ON_OFF)
-            {
-                if (device->nc_iface != NULL)
-                {
-                    org_mdr_noise_cancelling_set_enabled(
-                            device->nc_iface,
-                            param->nc_setting_value ==
-                                MDR_PACKET_NCASM_NC_SETTING_VALUE_ON);
-                }
-            }
-
-            free(param);
-        }
-        break;
-
-        case MDR_PACKET_NCASM_INQUIRED_TYPE_ASM:
-        {
-            mdr_packet_ncasm_param_asm_t* param = data;
-
-            if (device->asm_iface != NULL)
-            {
-                org_mdr_ambient_sound_mode_set_mode(
-                        device->asm_iface,
-                        param->asm_id == MDR_PACKET_NCASM_ASM_ID_VOICE
-                            ? "voice"
-                            : "normal");
-
-                org_mdr_ambient_sound_mode_set_amount(
-                        device->asm_iface,
-                        param->asm_amount);
-            }
-
-            free(param);
-        }
-        break;
-
-        case MDR_PACKET_NCASM_INQUIRED_TYPE_NOISE_CANCELLING_AND_ASM:
-        {
-            mdr_packet_ncasm_param_noise_cancelling_asm_t* param = data;
-
-            if (device->nc_iface != NULL)
-            {
-                org_mdr_noise_cancelling_set_enabled(
-                        device->nc_iface,
-                        param->ncasm_effect !=
-                            MDR_PACKET_NCASM_NCASM_EFFECT_OFF);
-            }
-
-            if (device->asm_iface != NULL)
-            {
-                org_mdr_ambient_sound_mode_set_mode(
-                        device->asm_iface,
-                        param->asm_id == MDR_PACKET_NCASM_ASM_ID_VOICE
-                            ? "voice"
-                            : "normal");
-
-                org_mdr_ambient_sound_mode_set_amount(
-                        device->asm_iface,
-                        param->asm_amount);
-            }
-
-            free(param);
-        }
-        break;
-    }
-}
-
-static gboolean on_ncasm_disable(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        device_t* device)
-{
-    mdr_device_ncasm_disable(
-            device->mdr_device,
-            device->ncasm_type,
-            NULL,
-            NULL,
-            NULL);
-
-    g_dbus_method_invocation_return_value(invocation, g_variant_new("()"));
-
-    return TRUE;
-}
-
-static gboolean on_ncasm_enable(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        device_t* device)
-{
-    mdr_device_ncasm_enable_nc(
-            device->mdr_device,
-            device->ncasm_type,
-            NULL,
-            NULL,
-            NULL);
-
-    g_dbus_method_invocation_return_value(invocation, g_variant_new("()"));
-
-    return TRUE;
-}
-
-static gboolean on_ncasm_set_asm_amount(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        guint amount,
-        device_t* device)
-{
-    bool voice = g_str_equal(
-            org_mdr_ambient_sound_mode_get_mode(device->asm_iface),
-            "voice");
-
-    mdr_device_ncasm_enable_asm(
-            device->mdr_device,
-            device->ncasm_type,
-            voice,
-            amount,
-            NULL,
-            NULL,
-            NULL);
-
-    g_dbus_method_invocation_return_value(invocation, g_variant_new("()"));
-
-    return TRUE;
-}
-
-static gboolean on_ncasm_set_asm_mode(
-        OrgMdrNoiseCancelling* profile_interface,
-        GDBusMethodInvocation* invocation,
-        const guchar* mode,
-        device_t* device)
-{
-    bool voice;
-
-    if (g_str_equal(mode, "voice"))
-    {
-        voice = true;
-    }
-    else if (g_str_equal(mode, "normal"))
-    {
-        voice = false;
-    }
-    else
-    {
-        g_dbus_method_invocation_return_dbus_error(
-                invocation,
-                "org.mdr.InvalidValue",
-                "mode must be 'voice' or 'normal'");
-        return TRUE;
-    }
-
-    mdr_device_ncasm_enable_asm(
-            device->mdr_device,
-            device->ncasm_type,
-            voice,
-            org_mdr_ambient_sound_mode_get_amount(device->asm_iface),
-            NULL,
-            NULL,
-            NULL);
-
-    g_dbus_method_invocation_return_value(invocation, g_variant_new("()"));
-
-    return TRUE;
+    device_unref(dev_source->device);
 }
