@@ -25,6 +25,11 @@ along with mdrd. If not, see <https://www.gnu.org/licenses/>.
 <node>
     <interface name="org.mdr.Device">
         <property name="name" type="s" access="read"/>
+        <signal name="connected"></signal>
+        <signal name="disconnected"></signal>
+    </interface>
+    <interface name="org.mdr.PowerOff">
+        <method name="PowerOff"></method>
     </interface>
     <interface name="org.mdr.Battery">
         <property name="level" type="u" access="read"/>
@@ -72,6 +77,14 @@ along with mdrd. If not, see <https://www.gnu.org/licenses/>.
         <property name="levels" type="au" access="read"/>
         <method name="SetLevels">
             <arg name="levels" type="au" direction="in"/>
+        </method>
+    </interface>
+    <interface name="org.mdr.AutoPowerOff">
+        <property name="available_timeouts" type="as" access="read"/>
+        <property name="timeout" type="s" access="read"/>
+
+        <method name="SetTimeout">
+            <arg name="timeout" type="s" direction="in"/>
         </method>
     </interface>
 </node>

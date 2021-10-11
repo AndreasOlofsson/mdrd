@@ -23,7 +23,7 @@
 #include "device.h"
 
 #include "mdr/device.h"
-#include "generated/mdr_device.h"
+#include "mdr_device_ifaces.h"
 
 #include <signal.h>
 
@@ -39,11 +39,25 @@ struct device
 
     device_source_t* source;
 
+    int registrations_in_progress;
+
     OrgMdrDevice* device_iface;
+    OrgMdrPowerOff* power_off_iface;
     OrgMdrBattery* battery_iface;
     OrgMdrLeftRightBattery* left_right_battery_iface;
     OrgMdrCradleBattery* cradle_battery_iface;
     OrgMdrLeftRight* left_right_iface;
+    OrgMdrNoiseCancelling* noise_cancelling_iface;
+    OrgMdrAmbientSoundMode* ambient_sound_mode_iface;
+    OrgMdrEq* eq_iface;
+    OrgMdrAutoPowerOff* auto_power_off_iface;
+
+    uint8_t asm_amount;
+    bool asm_voice;
+
+    uint8_t eq_band_count;
+    uint8_t eq_level_steps;
+    const gchar* eq_presets[0x100];
 };
 
 GHashTable* device_table;
@@ -134,10 +148,20 @@ void device_add(const gchar* name,
     device->dbus_name = g_strdup(name);
     device->mdr_device = mdr_device;
 
+    device->registrations_in_progress = 0;
+
+    device->device_iface = NULL;
+    device->power_off_iface = NULL;
     device->battery_iface = NULL;
     device->left_right_battery_iface = NULL;
     device->cradle_battery_iface = NULL;
     device->left_right_iface = NULL;
+    device->noise_cancelling_iface = NULL;
+    device->ambient_sound_mode_iface = NULL;
+    device->eq_iface = NULL;
+    device->auto_power_off_iface = NULL;
+
+    memset(&device->eq_presets, 0, sizeof(gchar*) * 0x100);
 
     init_data->device = device;
 
@@ -186,10 +210,18 @@ static void device_add_init_success(void* user_data)
             user_data);
 }
 
+static void device_start_registration(device_t*);
+static void device_finish_registration(device_t*);
+
+static void device_init_power_off(device_t*);
 static void device_init_battery(device_t*);
 static void device_init_left_right_battery(device_t*);
 static void device_init_cradle_battery(device_t*);
 static void device_init_left_right_connection_status(device_t*);
+static void device_init_noise_cancelling(device_t*);
+static void device_init_ambient_sound_mode(device_t*);
+static void device_init_eq(device_t* device);
+static void device_init_auto_power_off(device_t* device);
 
 static void device_add_init_name_success(uint8_t len,
                                          const uint8_t* name,
@@ -210,6 +242,9 @@ static void device_add_init_name_success(uint8_t len,
             device->dbus_name,
             &error))
     {
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->device_iface));
+
         org_mdr_device_set_name(
                 device->device_iface,
                 g_strndup((gchar*) name, len));
@@ -236,6 +271,9 @@ static void device_add_init_name_success(uint8_t len,
     mdr_device_supported_functions_t supported_functions
             = mdr_device_get_supported_functions(device->mdr_device);
 
+    if (supported_functions.power_off)
+        device_init_power_off(device);
+
     if (supported_functions.battery)
         device_init_battery(device);
 
@@ -247,6 +285,113 @@ static void device_add_init_name_success(uint8_t len,
 
     if (supported_functions.cradle_battery)
         device_init_cradle_battery(device);
+
+    if (supported_functions.noise_cancelling)
+        device_init_noise_cancelling(device);
+
+    if (supported_functions.ambient_sound_mode)
+        device_init_ambient_sound_mode(device);
+
+    if (supported_functions.eq || supported_functions.eq_non_customizable)
+        device_init_eq(device);
+
+    if (supported_functions.auto_power_off)
+        device_init_auto_power_off(device);
+
+    if (device->registrations_in_progress == 0)
+    {
+        org_mdr_device_emit_connected(device->device_iface);
+    }
+}
+
+static void device_start_registration(device_t* device)
+{
+    device->registrations_in_progress++;
+}
+
+static void device_finish_registration(device_t* device)
+{
+    device->registrations_in_progress--;
+
+    if (device->registrations_in_progress == 0)
+    {
+        org_mdr_device_emit_connected(device->device_iface);
+    }
+}
+
+static gboolean device_handle_power_off(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        gpointer user_data);
+
+static void device_init_power_off(device_t* device)
+{
+    device->power_off_iface = org_mdr_power_off_skeleton_new();
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+            G_DBUS_INTERFACE_SKELETON(device->power_off_iface),
+            connection,
+            device->dbus_name,
+            &error))
+    {
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->power_off_iface));
+
+        g_signal_connect(device->power_off_iface,
+                         "handle-power-off",
+                         G_CALLBACK(device_handle_power_off),
+                         device);
+    }
+    else
+    {
+        g_warning("Failed to register power off interface: "
+                  "%s", error->message);
+    }
+}
+
+static void device_handle_power_off_success(void* user_data);
+
+static void device_handle_power_off_error(void* user_data);
+
+static gboolean device_handle_power_off(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    if (mdr_device_power_off(
+            device->mdr_device,
+            device_handle_power_off_success,
+            device_handle_power_off_error,
+            invocation) < 0)
+    {
+        g_dbus_method_invocation_return_dbus_error(
+                invocation,
+                "org.mdr.DeviceError",
+                "Failed to make call.");
+    }
+
+    return TRUE;
+}
+
+static void device_handle_power_off_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void device_handle_power_off_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(
+            invocation,
+            "org.mdr.DeviceError",
+            "Call failed.");
 }
 
 static void device_init_battery_success(uint8_t level,
@@ -267,6 +412,7 @@ static void device_init_battery(device_t* device)
     }
     else
     {
+        device_start_registration(device);
         device_ref(device);
     }
 }
@@ -276,7 +422,8 @@ static void device_init_battery_error(void* user_data)
     device_t* device = user_data;
 
     g_warning("Device init battery failed: %d", errno);
-    
+
+    device_finish_registration(device);
     device_unref(device);
 }
 
@@ -300,6 +447,9 @@ static void device_init_battery_success(uint8_t level,
             device->dbus_name,
             &error))
     {
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->battery_iface));
+
         org_mdr_battery_set_level(device->battery_iface, level);
         org_mdr_battery_set_charging(device->battery_iface, charging);
 
@@ -316,6 +466,7 @@ static void device_init_battery_success(uint8_t level,
                   "%s", error->message);
     }
 
+    device_finish_registration(device);
     device_unref(device);
 }
 
@@ -352,6 +503,7 @@ static void device_init_left_right_battery(device_t* device)
     }
     else
     {
+        device_start_registration(device);
         device_ref(device);
     }
 }
@@ -362,6 +514,7 @@ static void device_init_left_right_battery_error(void* user_data)
 
     g_warning("Device init left-right battery failed: %d", errno);
     
+    device_finish_registration(device);
     device_unref(device);
 }
 
@@ -390,6 +543,9 @@ static void device_init_left_right_battery_success(uint8_t left_level,
             device->dbus_name,
             &error))
     {
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->left_right_battery_iface));
+
         org_mdr_left_right_battery_set_left_level(
                 device->left_right_battery_iface,
                 left_level);
@@ -417,6 +573,7 @@ static void device_init_left_right_battery_success(uint8_t left_level,
                   "%s", error->message);
     }
 
+    device_finish_registration(device);
     device_unref(device);
 }
 
@@ -463,6 +620,7 @@ static void device_init_cradle_battery(device_t* device)
     }
     else
     {
+        device_start_registration(device);
         device_ref(device);
     }
 }
@@ -473,6 +631,7 @@ static void device_init_cradle_battery_error(void* user_data)
 
     g_warning("Device init cradle battery failed: %d", errno);
     
+    device_finish_registration(device);
     device_unref(device);
 }
 
@@ -496,6 +655,9 @@ static void device_init_cradle_battery_success(uint8_t level,
             device->dbus_name,
             &error))
     {
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->cradle_battery_iface));
+
         org_mdr_cradle_battery_set_level(device->cradle_battery_iface, level);
         org_mdr_cradle_battery_set_charging(device->cradle_battery_iface,
                                             charging);
@@ -513,6 +675,7 @@ static void device_init_cradle_battery_success(uint8_t level,
                   "%s", error->message);
     }
 
+    device_finish_registration(device);
     device_unref(device);
 }
 
@@ -549,6 +712,7 @@ static void device_init_left_right_connection_status(device_t* device)
     }
     else
     {
+        device_start_registration(device);
         device_ref(device);
     }
 }
@@ -559,6 +723,7 @@ static void device_init_left_right_connection_status_error(void* user_data)
 
     g_warning("Device init left-right connection status failed: %d", errno);
     
+    device_finish_registration(device);
     device_unref(device);
 }
 
@@ -583,6 +748,9 @@ static void device_init_left_right_connection_status_success(
             device->dbus_name,
             &error))
     {
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->left_right_iface));
+
         org_mdr_left_right_set_left_connected(device->left_right_iface,
                                               left_connected);
         org_mdr_left_right_set_right_connected(device->left_right_iface,
@@ -601,6 +769,7 @@ static void device_init_left_right_connection_status_success(
                   "%s", error->message);
     }
 
+    device_finish_registration(device);
     device_unref(device);
 }
 
@@ -619,12 +788,1000 @@ static void device_left_right_connection_status_update(bool left_connected,
     }
 }
 
+static void device_init_noise_cancelling_success(bool enabled,
+                                                 void* user_data);
+
+static void device_init_noise_cancelling_error(void* user_data);
+
+static void device_init_noise_cancelling(device_t* device)
+{
+    if (mdr_device_get_noise_cancelling_enabled(
+                device->mdr_device,
+                device_init_noise_cancelling_success,
+                device_init_noise_cancelling_error,
+                device) < 0)
+    {
+        g_warning("Device init noise cancelling failed: %d", errno);
+    }
+    else
+    {
+        device_start_registration(device);
+        device_ref(device);
+    }
+}
+
+static void device_init_noise_cancelling_error(void* user_data)
+{
+    device_t* device = user_data;
+
+    g_warning("Device init noise cancelling failed: %d", errno);
+    
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_noise_cancelling_update(bool enabled,
+                                           void* user_data);
+
+static gboolean device_noise_cancelling_enable(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        gpointer user_data);
+
+static gboolean device_noise_cancelling_disable(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        gpointer user_data);
+
+static void device_init_noise_cancelling_success(bool enabled,
+                                                 void* user_data)
+{
+    device_t* device = user_data;
+
+    device->noise_cancelling_iface = org_mdr_noise_cancelling_skeleton_new();
+
+    g_signal_connect(device->noise_cancelling_iface,
+                     "handle-enable",
+                     G_CALLBACK(device_noise_cancelling_enable),
+                     device);
+
+    g_signal_connect(device->noise_cancelling_iface,
+                     "handle-disable",
+                     G_CALLBACK(device_noise_cancelling_disable),
+                     device);
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+            G_DBUS_INTERFACE_SKELETON(device->noise_cancelling_iface),
+            connection,
+            device->dbus_name,
+            &error))
+    {
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->noise_cancelling_iface));
+
+        org_mdr_noise_cancelling_set_enabled(device->noise_cancelling_iface,
+                                             enabled);
+
+        g_debug("Registered noise cancelling interface for '%s'",
+                device->dbus_name);
+
+        mdr_device_subscribe_noise_cancelling_enabled(
+                device->mdr_device,
+                device_noise_cancelling_update,
+                device);
+    }
+    else
+    {
+        g_warning("Failed to noise cancelling interface: "
+                  "%s", error->message);
+    }
+
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_noise_cancelling_enable_success(void*);
+
+static void device_noise_cancelling_enable_error(void*);
+
+static gboolean device_noise_cancelling_enable(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    mdr_device_enable_noise_cancelling(
+            device->mdr_device,
+            device_noise_cancelling_enable_success,
+            device_noise_cancelling_enable_error,
+            invocation);
+
+    return TRUE;
+}
+
+static void device_noise_cancelling_enable_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void device_noise_cancelling_enable_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(
+            invocation,
+            "org.mdr.DeviceError",
+            "Call failed");
+}
+
+static void device_noise_cancelling_disable_success(void*);
+
+static void device_noise_cancelling_disable_error(void*);
+
+static gboolean device_noise_cancelling_disable(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    mdr_device_disable_ncasm(
+            device->mdr_device,
+            device_noise_cancelling_disable_success,
+            device_noise_cancelling_disable_error,
+            invocation);
+
+    return TRUE;
+}
+
+static void device_noise_cancelling_disable_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void device_noise_cancelling_disable_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(
+            invocation,
+            "org.mdr.DeviceError",
+            "Call failed");
+}
+
+static void device_noise_cancelling_update(bool enabled,
+                                           void* user_data)
+{
+    device_t* device = user_data;
+
+    if (device->noise_cancelling_iface != NULL)
+    {
+        org_mdr_noise_cancelling_set_enabled(device->noise_cancelling_iface,
+                                             enabled);
+    }
+}
+
+static void device_init_ambient_sound_mode_success(uint8_t amount,
+                                                   bool voice,
+                                                   void* user_data);
+
+static void device_init_ambient_sound_mode_error(void* user_data);
+
+static void device_init_ambient_sound_mode(device_t* device)
+{
+    if (mdr_device_get_ambient_sound_mode_settings(
+                device->mdr_device,
+                device_init_ambient_sound_mode_success,
+                device_init_ambient_sound_mode_error,
+                device) < 0)
+    {
+        g_warning("Device init ambient sound mode failed: %d", errno);
+    }
+    else
+    {
+        device_start_registration(device);
+        device_ref(device);
+    }
+}
+
+static void device_init_ambient_sound_mode_error(void* user_data)
+{
+    device_t* device = user_data;
+
+    g_warning("Device init ambient sound mode failed: %d", errno);
+    
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_ambient_sound_mode_update(uint8_t amount,
+                                             bool voice,
+                                             void* user_data);
+
+static gboolean device_ambient_sound_mode_set_amount(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        guint32 amount,
+        gpointer user_data);
+
+static gboolean device_ambient_sound_mode_set_mode(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        const gchar* name,
+        gpointer user_data);
+
+static void device_init_ambient_sound_mode_success(uint8_t amount,
+                                                   bool voice,
+                                                   void* user_data)
+{
+    device_t* device = user_data;
+
+    device->asm_amount = amount;
+    device->asm_voice = voice;
+
+    device->ambient_sound_mode_iface
+        = org_mdr_ambient_sound_mode_skeleton_new();
+
+    g_signal_connect(device->ambient_sound_mode_iface,
+                     "handle-set-amount",
+                     G_CALLBACK(device_ambient_sound_mode_set_amount),
+                     device);
+
+    g_signal_connect(device->ambient_sound_mode_iface,
+                     "handle-set-mode",
+                     G_CALLBACK(device_ambient_sound_mode_set_mode),
+                     device);
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+            G_DBUS_INTERFACE_SKELETON(device->ambient_sound_mode_iface),
+            connection,
+            device->dbus_name,
+            &error))
+    {
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->ambient_sound_mode_iface));
+
+        org_mdr_ambient_sound_mode_set_amount(device->ambient_sound_mode_iface,
+                                              amount);
+        org_mdr_ambient_sound_mode_set_mode(device->ambient_sound_mode_iface,
+                                            voice ? "voice" : "normal");
+
+        g_debug("Registered ambient sound mode interface for '%s'",
+                device->dbus_name);
+
+        mdr_device_subscribe_ambient_sound_mode_settings(
+                device->mdr_device,
+                device_ambient_sound_mode_update,
+                device);
+    }
+    else
+    {
+        g_warning("Failed to ambient sound mode interface: "
+                  "%s", error->message);
+    }
+
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_ambient_sound_mode_set_amount_success(void*);
+
+static void device_ambient_sound_mode_set_amount_error(void*);
+
+static gboolean device_ambient_sound_mode_set_amount(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        guint32 amount,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    mdr_device_enable_ambient_sound_mode(
+            device->mdr_device,
+            amount > 0xff ? 0xff : amount,
+            device->asm_voice,
+            device_ambient_sound_mode_set_amount_success,
+            device_ambient_sound_mode_set_amount_error,
+            invocation);
+
+    return TRUE;
+}
+
+static void device_ambient_sound_mode_set_amount_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void device_ambient_sound_mode_set_amount_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(invocation,
+                                               "org.mdr.DeviceError",
+                                               "Call failed");
+}
+
+static void device_ambient_sound_mode_set_mode_success(void*);
+
+static void device_ambient_sound_mode_set_mode_error(void*);
+
+static gboolean device_ambient_sound_mode_set_mode(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        const gchar* name,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    bool voice;
+
+    if (!(voice = g_str_equal(name, "voice")) && !g_str_equal(name, "normal"))
+    {
+        g_dbus_method_invocation_return_dbus_error(invocation,
+                                                   "org.mdr.InvalidASMMode",
+                                                   "Invalid ASM mode, "
+                                                   "valid modes are: "
+                                                   "'voice' and 'normal'.");
+        return TRUE;
+    }
+
+    mdr_device_enable_ambient_sound_mode(
+            device->mdr_device,
+            device->asm_amount,
+            voice,
+            device_ambient_sound_mode_set_mode_success,
+            device_ambient_sound_mode_set_mode_error,
+            invocation);
+
+    return TRUE;
+}
+
+static void device_ambient_sound_mode_set_mode_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void device_ambient_sound_mode_set_mode_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(invocation,
+                                               "org.mdr.DeviceError",
+                                               "Call failed");
+}
+
+static void device_ambient_sound_mode_update(uint8_t amount,
+                                             bool voice,
+                                             void* user_data)
+{
+    device_t* device = user_data;
+
+    device->asm_amount = amount;
+    device->asm_voice = voice;
+
+    if (device->ambient_sound_mode_iface != NULL)
+    {
+        org_mdr_ambient_sound_mode_set_amount(device->ambient_sound_mode_iface,
+                                              amount);
+        org_mdr_ambient_sound_mode_set_mode(device->ambient_sound_mode_iface,
+                                            voice ? "voice" : "normal");
+    }
+}
+
+static void device_init_eq_get_capabilities_result(
+        uint8_t band_count,
+        uint8_t level_steps,
+        uint8_t num_presets,
+        mdr_packet_eqebb_eq_preset_id_t* presets,
+        void* user_data);
+
+static void device_init_eq_error(void* user_data);
+
+static void device_init_eq(device_t* device)
+{
+    if (mdr_device_get_eq_capabilities(
+            device->mdr_device,
+            device_init_eq_get_capabilities_result,
+            device_init_eq_error,
+            device) < 0)
+    {
+        g_warning("Device init EQ failed: %d", errno);
+    }
+    else
+    {
+        device_start_registration(device);
+        device_ref(device);
+    }
+}
+
+static void device_init_eq_get_preset_and_levels_result(
+        mdr_packet_eqebb_eq_preset_id_t,
+        uint8_t num_levels,
+        uint8_t* levels,
+        void* user_data);
+
+static void device_init_eq_get_capabilities_result(
+        uint8_t band_count,
+        uint8_t level_steps,
+        uint8_t num_presets,
+        mdr_packet_eqebb_eq_preset_id_t* presets,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    device->eq_band_count = band_count;
+    device->eq_level_steps = level_steps;
+
+    for (int i = 0; i < num_presets; i++)
+    {
+        mdr_packet_eqebb_eq_preset_id_t preset = presets[i];
+
+        const char* name = mdr_packet_eqebb_get_preset_name(preset);
+        if (name == NULL)
+        {
+            continue;
+        }
+
+        device->eq_presets[preset] = name;
+    }
+
+    mdr_device_get_eq_preset_and_levels(
+            device->mdr_device,
+            device_init_eq_get_preset_and_levels_result,
+            device_init_eq_error,
+            device);
+}
+
+static gboolean device_eq_set_preset(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        const gchar* preset,
+        gpointer user_data);
+
+static gboolean device_eq_set_levels(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        GVariant* levels,
+        gpointer user_data);
+
+static void device_eq_preset_and_levels_update(
+        mdr_packet_eqebb_eq_preset_id_t preset_id,
+        uint8_t num_levels,
+        uint8_t* levels,
+        void* user_data);
+
+static void device_init_eq_get_preset_and_levels_result(
+        mdr_packet_eqebb_eq_preset_id_t preset_id,
+        uint8_t num_levels,
+        uint8_t* levels,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    device->eq_iface = org_mdr_eq_skeleton_new();
+
+    g_signal_connect(device->eq_iface,
+                     "handle-set-preset",
+                     G_CALLBACK(device_eq_set_preset),
+                     device);
+
+    g_signal_connect(device->eq_iface,
+                     "handle-set-levels",
+                     G_CALLBACK(device_eq_set_levels),
+                     device);
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+            G_DBUS_INTERFACE_SKELETON(device->eq_iface),
+            connection,
+            device->dbus_name,
+            &error))
+    {
+        g_dbus_interface_skeleton_flush(
+                G_DBUS_INTERFACE_SKELETON(device->eq_iface));
+
+        const gchar* preset_name = device->eq_presets[preset_id];
+
+        if (preset_name == NULL)
+        {
+            preset_name = "<Unknown>";
+        }
+
+        int preset_count = 0;
+        for (int i = 0; i < 0x100; i++)
+        {
+            if (device->eq_presets[i] != NULL)
+                preset_count++;
+        }
+
+        const gchar** preset_names = g_malloc_n(preset_count + 1, sizeof(gchar*));
+        for (int i = 0, j = 0; i < 0x100; i++)
+        {
+            if (device->eq_presets[i] != NULL)
+            {
+                preset_names[j] = device->eq_presets[i];
+                j++;
+            }
+        }
+        preset_names[preset_count] = 0;
+
+        GVariantBuilder* levels_variant = g_variant_builder_new(G_VARIANT_TYPE("au"));
+
+        for (int i = 0; i < num_levels; i++)
+        {
+            g_variant_builder_add(levels_variant, "u", (guint32) levels[i]);
+        }
+
+        org_mdr_eq_set_band_count(device->eq_iface, device->eq_band_count);
+        org_mdr_eq_set_level_steps(device->eq_iface, device->eq_level_steps);
+        org_mdr_eq_set_preset(device->eq_iface, preset_name);
+        org_mdr_eq_set_available_presets(device->eq_iface, preset_names);
+        org_mdr_eq_set_levels(device->eq_iface,
+                              g_variant_builder_end(levels_variant));
+
+        g_debug("Registered EQ interface for '%s'", device->dbus_name);
+
+        g_free(preset_names);
+
+        mdr_device_subscribe_eq_preset_and_levels(
+                device->mdr_device,
+                device_eq_preset_and_levels_update,
+                device);
+    }
+    else
+    {
+        g_warning("Failed to register EQ interface: "
+                  "%s", error->message);
+    }
+
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_init_eq_error(void* user_data)
+{
+    device_t* device = user_data;
+
+    g_warning("Device init EQ failed: %d", errno);
+
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_eq_set_preset_success(void* user_data);
+
+static void device_eq_set_preset_error(void* user_data);
+
+static gboolean device_eq_set_preset(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        const gchar* preset,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    mdr_packet_eqebb_eq_preset_id_t preset_id;
+    bool preset_found = false;
+
+    for (int i = 0; i < 0x100; i++)
+    {
+        if (device->eq_presets[i] != NULL
+                && g_str_equal(device->eq_presets[i], preset))
+        {
+            preset_id = i;
+            preset_found = true;
+            break;
+        }
+    }
+
+    if (!preset_found)
+    {
+        g_dbus_method_invocation_return_dbus_error(
+                invocation,
+                "org.mdr.InvalidValue",
+                "Preset not found");
+        return TRUE;
+    }
+
+    if (mdr_device_set_eq_preset(
+            device->mdr_device,
+            preset_id,
+            device_eq_set_preset_success,
+            device_eq_set_preset_error,
+            invocation) < 0)
+    {
+        g_dbus_method_invocation_return_dbus_error(
+                invocation,
+                "org.mdr.DeviceError",
+                "Failed to make the call.");
+    }
+
+    return TRUE;
+}
+
+static void device_eq_set_preset_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void device_eq_set_preset_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(
+            invocation,
+            "org.mdr.DeviceError",
+            "Call failed.");
+}
+
+static void device_eq_set_levels_success(void* user_data);
+
+static void device_eq_set_levels_error(void* user_data);
+
+static gboolean device_eq_set_levels(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        GVariant* levels_variant,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    gsize num_levels;
+    const guint32* level_ints = g_variant_get_fixed_array(levels_variant,
+                                                          &num_levels,
+                                                          sizeof(guint32));
+
+    if (num_levels != device->eq_band_count)
+    {
+        g_dbus_method_invocation_return_dbus_error(
+                invocation,
+                "org.mdr.InvalidValue",
+                "The number of bands must match the device's.");
+        return TRUE;
+    }
+
+    uint8_t* level_bytes = g_malloc_n(num_levels, sizeof(uint8_t));
+    if (level_bytes == NULL)
+    {
+        // TODO
+    }
+    
+
+    for (int i = 0; i < num_levels; i++)
+    {
+        if (level_ints[i] >= device->eq_level_steps)
+        {
+            g_dbus_method_invocation_return_dbus_error(
+                    invocation,
+                    "org.mdr.InvalidValue",
+                    "Level not within range.");
+            return TRUE;
+        }
+
+        level_bytes[i] = level_ints[i];
+    }
+
+    if (device->eq_iface)
+    {
+        org_mdr_eq_set_levels(device->eq_iface, levels_variant);
+    }
+
+    mdr_device_set_eq_levels(
+            device->mdr_device,
+            num_levels,
+            level_bytes,
+            device_eq_set_levels_success,
+            device_eq_set_levels_error,
+            invocation);
+
+    free(level_bytes);
+
+    return TRUE;
+}
+
+static void device_eq_set_levels_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void device_eq_set_levels_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(
+            invocation,
+            "org.mdr.DeviceError",
+            "Call failed.");
+}
+
+static void device_eq_preset_and_levels_update(
+        mdr_packet_eqebb_eq_preset_id_t preset_id,
+        uint8_t num_levels,
+        uint8_t* levels,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    if (device->eq_iface != NULL)
+    {
+        const gchar* preset_name = device->eq_presets[preset_id];
+
+        if (preset_name == NULL)
+        {
+            preset_name = "<Unknown>";
+        }
+
+        GVariantBuilder* levels_variant = g_variant_builder_new(G_VARIANT_TYPE("au"));
+
+        for (int i = 0; i < num_levels; i++)
+        {
+            g_variant_builder_add(levels_variant, "u", (guint32) levels[i]);
+        }
+
+        org_mdr_eq_set_preset(device->eq_iface, preset_name);
+        org_mdr_eq_set_levels(device->eq_iface,
+                              g_variant_builder_end(levels_variant));
+    }
+}
+
+static void device_init_auto_power_off_result(
+        bool enabled,
+        mdr_packet_system_auto_power_off_element_id_t timeout,
+        void* user_data);
+
+static void device_init_auto_power_off_error(void* user_data);
+
+static void device_init_auto_power_off(device_t* device)
+{
+    if (mdr_device_setting_get_auto_power_off(
+            device->mdr_device,
+            device_init_auto_power_off_result,
+            device_init_auto_power_off_error,
+            device) < 0)
+    {
+        g_warning("Device init auto power off failed (1): %d", errno);
+    }
+    else
+    {
+        device_start_registration(device);
+        device_ref(device);
+    }
+}
+
+static const gchar* auto_power_off_timeout_to_string(
+        mdr_packet_system_auto_power_off_element_id_t timeout)
+{
+    switch (timeout)
+    {
+        case MDR_PACKET_SYSTEM_AUTO_POWER_OFF_ELEMENT_ID_POWER_OFF_IN_5_MIN:
+            return "5 min";
+
+        case MDR_PACKET_SYSTEM_AUTO_POWER_OFF_ELEMENT_ID_POWER_OFF_IN_30_MIN:
+            return "30 min";
+
+        case MDR_PACKET_SYSTEM_AUTO_POWER_OFF_ELEMENT_ID_POWER_OFF_IN_60_MIN:
+            return "60 min";
+
+        case MDR_PACKET_SYSTEM_AUTO_POWER_OFF_ELEMENT_ID_POWER_OFF_IN_180_MIN:
+            return "180 min";
+
+        default:
+            return NULL;
+    }
+}
+
+static gboolean device_auto_power_off_set_timeout(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        const gchar* timeout,
+        gpointer user_data);
+
+static void device_auto_power_off_update(
+        bool enabled,
+        mdr_packet_system_auto_power_off_element_id_t timeout,
+        void* user_data);
+
+static void device_init_auto_power_off_result(
+        bool enabled,
+        mdr_packet_system_auto_power_off_element_id_t timeout,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    device->auto_power_off_iface = org_mdr_auto_power_off_skeleton_new();
+
+    g_signal_connect(device->auto_power_off_iface,
+                     "handle-set-timeout",
+                     G_CALLBACK(device_auto_power_off_set_timeout),
+                     device);
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+                G_DBUS_INTERFACE_SKELETON(device->auto_power_off_iface),
+                connection,
+                device->dbus_name,
+                &error))
+    {
+        const gchar* timeouts[5] = {
+            "5 min",
+            "30 min",
+            "60 min",
+            "180 min",
+        };
+
+        org_mdr_auto_power_off_set_available_timeouts(
+                device->auto_power_off_iface,
+                timeouts);
+
+        if (enabled)
+        {
+            const gchar* timeout_str = auto_power_off_timeout_to_string(timeout);
+
+            if (timeout_str == NULL)
+                timeout_str = "<Unknown>";
+
+            org_mdr_auto_power_off_set_timeout(device->auto_power_off_iface,
+                                               timeout_str);
+
+        }
+        else
+        {
+            org_mdr_auto_power_off_set_timeout(device->auto_power_off_iface,
+                                               "Off");
+        }
+
+        g_debug("Registered auto power off interface for '%s'", device->dbus_name);
+
+        mdr_device_setting_subscribe_auto_power_off(
+                device->mdr_device,
+                device_auto_power_off_update,
+                device);
+    }
+    else
+    {
+        device->auto_power_off_iface = NULL;
+
+        g_warning("Failed to register auto power off interface (5): "
+                  "%s", error->message);
+    }
+
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_auto_power_off_set_timeout_success(void* user_data);
+
+static void device_auto_power_off_set_timeout_error(void* user_data);
+
+static gboolean device_auto_power_off_set_timeout(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        const gchar* timeout,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    mdr_packet_system_auto_power_off_element_id_t timeout_id;
+
+    if (g_str_equal(timeout, "Off"))
+    {
+        mdr_device_setting_disable_auto_power_off(
+                device->mdr_device,
+                device_auto_power_off_set_timeout_success,
+                device_auto_power_off_set_timeout_error,
+                invocation);
+    }
+    else
+    {
+        if (g_str_equal(timeout, "5 min"))
+            timeout_id = MDR_PACKET_SYSTEM_AUTO_POWER_OFF_ELEMENT_ID_POWER_OFF_IN_5_MIN;
+        else if (g_str_equal(timeout, "30 min"))
+            timeout_id = MDR_PACKET_SYSTEM_AUTO_POWER_OFF_ELEMENT_ID_POWER_OFF_IN_30_MIN;
+        else if (g_str_equal(timeout, "60 min"))
+            timeout_id = MDR_PACKET_SYSTEM_AUTO_POWER_OFF_ELEMENT_ID_POWER_OFF_IN_60_MIN;
+        else if (g_str_equal(timeout, "180 min"))
+            timeout_id = MDR_PACKET_SYSTEM_AUTO_POWER_OFF_ELEMENT_ID_POWER_OFF_IN_180_MIN;
+        else
+        {
+            g_dbus_method_invocation_return_dbus_error(
+                    invocation,
+                    "org.mdr.InvalidValue",
+                    "Invalid timeout");
+            return TRUE;
+        }
+
+        mdr_device_setting_enable_auto_power_off(
+                device->mdr_device,
+                timeout_id,
+                device_auto_power_off_set_timeout_success,
+                device_auto_power_off_set_timeout_error,
+                invocation);
+    }
+
+    return TRUE;
+}
+
+
+static void device_auto_power_off_set_timeout_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void device_auto_power_off_set_timeout_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(
+            invocation,
+            "org.mdr.DeviceError",
+            "Call failed.");
+}
+
+static void device_auto_power_off_update(
+        bool enabled,
+        mdr_packet_system_auto_power_off_element_id_t timeout,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    if (device->auto_power_off_iface)
+    {
+        if (enabled)
+        {
+            const gchar* timeout_str = auto_power_off_timeout_to_string(timeout);
+
+            if (timeout_str == NULL)
+                timeout_str = "<Unknown>";
+
+            org_mdr_auto_power_off_set_timeout(device->auto_power_off_iface,
+                                               timeout_str);
+
+        }
+        else
+        {
+            org_mdr_auto_power_off_set_timeout(device->auto_power_off_iface,
+                                               "Off");
+        }
+    }
+}
+
+static void device_init_auto_power_off_error(void* user_data)
+{
+    device_t* device = user_data;
+
+    device->auto_power_off_iface = NULL;
+    g_warning("Device init auto power off failed (4): %d", errno);
+
+    device_finish_registration(device);
+    device_unref(device);
+}
 
 static void device_add_init_error(void* user_data)
 {
     device_add_init_data* init_data = user_data;
 
-    init_data->error_cb(init_data->error_cb);
+    init_data->error_cb(init_data->user_data);
 }
 
 void device_remove(const gchar* name)
@@ -663,6 +1820,8 @@ static void device_unref(device_t* device)
 
     if (device->ref_count <= 0)
     {
+        org_mdr_device_emit_disconnected(device->device_iface);
+
         org_mdr_device_set_name(device->device_iface, "");
         g_dbus_interface_skeleton_flush(
                 G_DBUS_INTERFACE_SKELETON(device->device_iface));
@@ -671,6 +1830,14 @@ static void device_unref(device_t* device)
                 G_DBUS_INTERFACE_SKELETON(device->device_iface),
                 connection);
         g_object_unref(device->device_iface);
+
+        if (device->power_off_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->power_off_iface),
+                    connection);
+            g_object_unref(device->power_off_iface);
+        }
 
         if (device->battery_iface != NULL)
         {
@@ -703,6 +1870,38 @@ static void device_unref(device_t* device)
                     connection);
             g_object_unref(device->left_right_iface);
         }
+
+        if (device->noise_cancelling_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->noise_cancelling_iface),
+                    connection);
+            g_object_unref(device->noise_cancelling_iface);
+        }
+
+        if (device->ambient_sound_mode_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->ambient_sound_mode_iface),
+                    connection);
+            g_object_unref(device->ambient_sound_mode_iface);
+        }
+
+        if (device->eq_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->eq_iface),
+                    connection);
+            g_object_unref(device->eq_iface);
+        }
+
+        if (device->auto_power_off_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->auto_power_off_iface),
+                    connection);
+            g_object_unref(device->auto_power_off_iface);
+        }
     }
 }
 
@@ -718,7 +1917,7 @@ static gboolean device_source_prepare(GSource* source, gint* timeout)
     mdr_poll_info poll_info = mdr_device_poll_info(dev_source->device->mdr_device);
     *timeout = poll_info.timeout;
     dev_source->poll_fd.events
-        = dev_source->poll_fd.events & ~G_IO_OUT
+        = (dev_source->poll_fd.events & ~G_IO_OUT)
         | (poll_info.write ? G_IO_OUT : 0);
     dev_source->poll_fd.revents = 0;
 
