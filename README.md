@@ -2,6 +2,8 @@
 
 A daemon that uses [libmdr](https://github.com/AndreasOlofsson/libmdr) and the Bluez stack to connect to any MDR-devices (Sony wireless headphones) and expose them on the system D-Bus.
 
+See [MDR Manager](http://github.com/AndreasOlofsson/mdr-manager) for the frontend.
+
 _Please note that this project is a work in progress and that the DBus API is likely to change until it reaches v1.0._
 
 ## Building

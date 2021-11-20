@@ -51,6 +51,8 @@ struct device
     OrgMdrAmbientSoundMode* ambient_sound_mode_iface;
     OrgMdrEq* eq_iface;
     OrgMdrAutoPowerOff* auto_power_off_iface;
+    OrgMdrKeyFunctions* key_functions_iface;
+    OrgMdrPlayback* playback_iface;
 
     uint8_t asm_amount;
     bool asm_voice;
@@ -160,6 +162,8 @@ void device_add(const gchar* name,
     device->ambient_sound_mode_iface = NULL;
     device->eq_iface = NULL;
     device->auto_power_off_iface = NULL;
+    device->key_functions_iface = NULL;
+    device->playback_iface = NULL;
 
     memset(&device->eq_presets, 0, sizeof(gchar*) * 0x100);
 
@@ -222,6 +226,8 @@ static void device_init_noise_cancelling(device_t*);
 static void device_init_ambient_sound_mode(device_t*);
 static void device_init_eq(device_t* device);
 static void device_init_auto_power_off(device_t* device);
+static void device_init_key_functions(device_t* device);
+static void device_init_playback(device_t* device);
 
 static void device_add_init_name_success(uint8_t len,
                                          const uint8_t* name,
@@ -297,6 +303,12 @@ static void device_add_init_name_success(uint8_t len,
 
     if (supported_functions.auto_power_off)
         device_init_auto_power_off(device);
+
+    if (supported_functions.assignable_settings)
+        device_init_key_functions(device);
+
+    if (supported_functions.playback_controller)
+        device_init_playback(device);
 
     if (device->registrations_in_progress == 0)
     {
@@ -1720,7 +1732,6 @@ static gboolean device_auto_power_off_set_timeout(
     return TRUE;
 }
 
-
 static void device_auto_power_off_set_timeout_success(void* user_data)
 {
     GDBusMethodInvocation* invocation = user_data;
@@ -1772,6 +1783,695 @@ static void device_init_auto_power_off_error(void* user_data)
 
     device->auto_power_off_iface = NULL;
     g_warning("Device init auto power off failed (4): %d", errno);
+
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_init_key_functions_available_result(
+        uint8_t num_keys,
+        mdr_packet_system_assignable_settings_capability_key_t* keys,
+        void* user_data);
+
+static void device_init_key_functions_error(void* user_data);
+
+static void device_init_key_functions(device_t* device)
+{
+    if (mdr_device_setting_get_available_button_presets(
+                device->mdr_device,
+                device_init_key_functions_available_result,
+                device_init_key_functions_error,
+                device) < 0)
+    {
+        g_warning("Device init key functions failed (1): %d", errno);
+    }
+    else
+    {
+        device_start_registration(device);
+        device_ref(device);
+    }
+}
+
+static const char* key_functions_key_to_string(
+        mdr_packet_system_assignable_settings_key_t);
+
+static const char* key_functions_key_type_to_string(
+        mdr_packet_system_assignable_settings_key_type_t);
+
+static const char* key_functions_preset_to_string(
+        mdr_packet_system_assignable_settings_preset_t);
+
+static const char* key_functions_action_to_string(
+        mdr_packet_system_assignable_settings_action_t);
+
+static const char* key_functions_function_to_string(
+        mdr_packet_system_assignable_settings_function_t);
+
+static mdr_packet_system_assignable_settings_preset_t
+        key_functions_string_to_preset(const char*);
+
+static void device_init_key_functions_active_result(
+        uint8_t num_presets,
+        mdr_packet_system_assignable_settings_preset_t* presets,
+        void* user_data);
+
+static void device_init_key_functions_available_result(
+        uint8_t num_keys,
+        mdr_packet_system_assignable_settings_capability_key_t* keys,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    if (mdr_device_setting_get_active_button_presets(
+                device->mdr_device,
+                device_init_key_functions_active_result,
+                device_init_key_functions_error,
+                device) < 0)
+    {
+        g_warning("Device init key functions failed (1): %d", errno);
+    }
+    else
+    {
+        device->key_functions_iface = org_mdr_key_functions_skeleton_new();
+
+        GVariantBuilder* available_presets
+                = g_variant_builder_new(G_VARIANT_TYPE("a{s(ssa{sa{ss}})}"));
+
+        for (
+                mdr_packet_system_assignable_settings_capability_key_t* key
+                    = keys;
+                key != &keys[num_keys];
+                key++)
+        {
+            const char* key_name
+                = key_functions_key_to_string(key->key);
+
+            if (key_name == NULL) continue;
+
+            const char* key_type
+                = key_functions_key_type_to_string(key->key_type);
+
+            if (key_type == NULL) continue;
+
+            const char* default_preset
+                = key_functions_preset_to_string(key->default_preset);
+
+            if (default_preset == NULL) continue;
+
+            GVariantBuilder* presets
+                = g_variant_builder_new(G_VARIANT_TYPE("a{sa{ss}}"));
+
+            for (
+                    mdr_packet_system_assignable_settings_capability_preset_t* preset
+                        = key->capability_presets;
+                    preset != &key->capability_presets[key->num_capability_presets];
+                    preset++)
+            {
+                GVariantBuilder* actions
+                    = g_variant_builder_new(G_VARIANT_TYPE("a{ss}"));
+
+                const char* preset_name
+                    = key_functions_preset_to_string(preset->preset);
+
+                if (preset_name == NULL) continue;
+
+                for (
+                        mdr_packet_system_assignable_settings_capability_action_t* action
+                            = preset->capability_actions;
+                        action != &preset->capability_actions[preset->num_capability_actions];
+                        action++)
+                {
+                    const char* action_name
+                        = key_functions_action_to_string(action->action);
+
+                    if (action_name == NULL) continue;
+
+                    const char* function
+                        = key_functions_function_to_string(action->function);
+
+                    if (function == NULL) continue;
+
+                    g_variant_builder_add(
+                            actions,
+                            "{ss}",
+                            action_name,
+                            function);
+                }
+
+                g_variant_builder_add(presets,
+                                      "{sa{ss}}",
+                                      preset_name,
+                                      actions);
+            }
+
+            g_variant_builder_add(available_presets,
+                                  "{s(ssa{sa{ss}})}",
+                                  key_name,
+                                  key_type,
+                                  default_preset,
+                                  presets);
+        }
+
+        org_mdr_key_functions_set_available_presets(
+                device->key_functions_iface,
+                g_variant_builder_end(available_presets));
+    }
+}
+
+static gboolean key_functions_handle_set_presets(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        GVariant* presets,
+        gpointer user_data);
+
+static void key_functions_active_update(
+        uint8_t num_presets,
+        mdr_packet_system_assignable_settings_preset_t* presets,
+        void* user_data);
+
+static void device_init_key_functions_active_result(
+        uint8_t num_presets,
+        mdr_packet_system_assignable_settings_preset_t* presets,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    GVariantIter* key_iter = g_variant_iter_new(
+            org_mdr_key_functions_get_available_presets(
+                device->key_functions_iface));
+
+    GVariantBuilder* active_presets
+        = g_variant_builder_new(G_VARIANT_TYPE("a{ss}"));
+
+    const gchar* key_name;
+
+    for (int i = 0;
+            i < num_presets && g_variant_iter_loop(key_iter,
+                                                   "{s@(ssa{sa{ss}})}",
+                                                   &key_name,
+                                                   NULL);
+            i++)
+    {
+        const gchar* preset_name = key_functions_preset_to_string(presets[i]);
+
+        if (preset_name == NULL) continue;
+
+        g_variant_builder_add(active_presets, "{ss}", key_name, preset_name);
+    }
+
+    g_variant_iter_free(key_iter);
+
+    org_mdr_key_functions_set_current_presets(
+            device->key_functions_iface,
+            g_variant_builder_end(active_presets));
+
+    g_signal_connect(device->key_functions_iface,
+                     "handle-set-presets",
+                     G_CALLBACK(key_functions_handle_set_presets),
+                     device);
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+                G_DBUS_INTERFACE_SKELETON(device->key_functions_iface),
+                connection,
+                device->dbus_name,
+                &error))
+    {
+        mdr_device_setting_subscribe_active_button_presets(
+                device->mdr_device,
+                key_functions_active_update,
+                device);
+    }
+    else
+    {
+        device->auto_power_off_iface = NULL;
+
+        g_warning("Failed to register key functions interface (5): "
+                  "%s", error->message);
+    }
+
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void key_functions_active_update(
+        uint8_t num_presets,
+        mdr_packet_system_assignable_settings_preset_t* presets,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    GVariantIter* key_iter = g_variant_iter_new(
+            org_mdr_key_functions_get_available_presets(
+                device->key_functions_iface));
+
+    GVariantBuilder* active_presets
+        = g_variant_builder_new(G_VARIANT_TYPE("a{ss}"));
+
+    const gchar* key_name;
+
+    for (int i = 0;
+            i < num_presets && g_variant_iter_loop(key_iter,
+                                                   "{s@(ssa{sa{ss}})}",
+                                                   &key_name,
+                                                   NULL);
+            i++)
+    {
+        const gchar* preset_name = key_functions_preset_to_string(presets[i]);
+
+        if (preset_name == NULL) continue;
+
+        g_variant_builder_add(active_presets, "{ss}", key_name, preset_name);
+    }
+
+    g_variant_iter_free(key_iter);
+
+    org_mdr_key_functions_set_current_presets(
+            device->key_functions_iface,
+            g_variant_builder_end(active_presets));
+}
+
+static void key_functions_handle_set_presets_success(void* user_data);
+
+static void key_functions_handle_set_presets_error(void* user_data);
+
+static gboolean key_functions_handle_set_presets(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        GVariant* presets,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    if (g_variant_n_children(presets) > 0xff)
+    {
+        g_dbus_method_invocation_return_dbus_error(
+                invocation,
+                "error name",
+                "error message");
+
+        return TRUE;
+    }
+
+    uint8_t num_presets = g_variant_n_children(presets);
+
+    mdr_packet_system_assignable_settings_preset_t* enum_presets
+        = g_malloc_n(num_presets,
+                     sizeof(mdr_packet_system_assignable_settings_preset_t));
+    int i = 0;
+
+    GVariantIter* iter = g_variant_iter_new(
+            org_mdr_key_functions_get_available_presets(
+                device->key_functions_iface));
+    const gchar* key;
+    GVariant* key_presets;
+
+    while (g_variant_iter_loop(iter,
+                               "{s(@s@s@a{sa{ss}})}",
+                               &key,
+                               NULL,
+                               NULL,
+                               &key_presets))
+    {
+        const gchar* key_preset;
+        if (g_variant_lookup(presets, key, "s", &key_preset))
+        {
+            if (g_variant_lookup(key_presets, key_preset, "@a{ss}", NULL))
+            {
+                enum_presets[i] = key_functions_string_to_preset(key_preset);
+                i++;
+            }
+            else
+            {
+                g_free(enum_presets);
+                g_variant_iter_free(iter);
+                g_dbus_method_invocation_return_dbus_error(
+                        invocation,
+                        "org.mdr.InvalidValue",
+                        "Invalid preset. ");
+                return TRUE;
+            }
+        }
+        else
+        {
+            g_free(enum_presets);
+            g_variant_iter_free(iter);
+            g_dbus_method_invocation_return_dbus_error(
+                    invocation,
+                    "org.mdr.InvalidValue",
+                    "Missing key. ");
+            return TRUE;
+        }
+    }
+
+    if (mdr_device_setting_set_active_button_presets(
+            device->mdr_device,
+            num_presets,
+            enum_presets,
+            key_functions_handle_set_presets_success,
+            key_functions_handle_set_presets_error,
+            invocation) < 0)
+    {
+        g_dbus_method_invocation_return_dbus_error(
+                invocation,
+                "org.mdr.DeviceError",
+                "Call failed. ");
+    }
+
+    return TRUE;
+}
+
+static void key_functions_handle_set_presets_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void key_functions_handle_set_presets_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(
+            invocation,
+            "org.mdr.DeviceError",
+            "Call failed. ");
+}
+
+static const char* key_functions_key_to_string(
+        mdr_packet_system_assignable_settings_key_t key)
+{
+    switch (key)
+    {
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_KEY_LEFT_SIDE_KEY:
+            return "Left";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_KEY_RIGHT_SIDE_KEY:
+            return "Right";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_KEY_CUSTOM_KEY:
+            return "Custom";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_KEY_C_KEY:
+            return "C";
+        default:
+            return NULL;
+    }
+}
+
+static const char* key_functions_key_type_to_string(
+        mdr_packet_system_assignable_settings_key_type_t key_type)
+{
+    switch (key_type)
+    {
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_KEYS_TYPE_TOUCH_SENSOR:
+            return "touch";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_KEYS_TYPE_BUTTON:
+            return "button";
+        default:
+            return NULL;
+    }
+}
+
+static const char* key_functions_preset_to_string(
+        mdr_packet_system_assignable_settings_preset_t preset)
+{
+    switch (preset)
+    {
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_AMBIENT_SOUND_CONTROL:
+            return "Ambient Sound Control";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_VOLUME_CONTROL:
+            return "Volume Control";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_PLAYBACK_CONTROL:
+            return "Playback Control";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_VOICE_RECOGNITION:
+            return "Voice Recognition";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_GOOGLE_ASSISTANT:
+            return "Google Assistant";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_AMAZON_ALEXA:
+            return "Amazon Alexa";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_TENCENT_XIAOWEI:
+            return "Tencent Xiaowei";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_NO_FUNCTION:
+            return "No Function";
+        default:
+            return NULL;
+    }
+}
+
+static const char* key_functions_action_to_string(
+        mdr_packet_system_assignable_settings_action_t action)
+{
+    switch (action)
+    {
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_ACTION_SINGLE_TAP:
+            return "Single Tap";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_ACTION_DOUBLE_TAP:
+            return "Double Tap";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_ACTION_TRIPLE_TAP:
+            return "Triple Tap";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_ACTION_SINGLE_TAP_AND_HOLD:
+            return "Single Tap and Hold";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_ACTION_DOUBLE_TAP_AND_HOLD:
+            return "Double Tap and Hold";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_ACTION_LONG_PRESS_THEN_ACTIVATE:
+            return "Long Press and Activate";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_ACTION_LONG_PRESS_DURING_ACTIVATION:
+            return "Long Press during Activation";
+        default:
+            return NULL;
+    }
+}
+
+static const char* key_functions_function_to_string(
+        mdr_packet_system_assignable_settings_function_t function)
+{
+    switch (function)
+    {
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_NO_FUNCTION:
+            return "None";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_NC_ASM_OFF:
+            return "Noise Canceling/Ambient Sound/Off";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_NC_OPTIMIZER:
+            return "Noise Canceling Optimizer";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_QUICK_ATTENTION:
+            return "Quick Attention";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_VOLUME_UP:
+            return "Raise the Volume";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_VOLUME_DOWN:
+            return "Lower the Volume";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_PLAY_PAUSE:
+            return "Play/Pause";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_NEXT_TRACK:
+            return "Next Song";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_PREVIOUS_TRACK:
+            return "Previous Song";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_VOICE_RECOGNITION:
+            return "Launch the Voice Assist Function";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_GET_YOUR_NOTIFICATION:
+            return "Voice Notification";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_TALK_TO_GA:
+            return "Audio Input";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_STOP_GA:
+            return "Cancel Audio Input";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_VOICE_INPUT_CANCEL_AA:
+            return "Audio Input/Cancel";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_TALK_TO_TENCENT_XIAOWEI:
+            return "Audio Input";
+        case MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_FUNCTION_CANCEL_VOICE_RECOGNITION:
+            return "Cancel the Voice Assist Function";
+        default:
+            return NULL;
+    }
+}
+
+static mdr_packet_system_assignable_settings_preset_t
+        key_functions_string_to_preset(const char* str)
+{
+    if (g_str_equal(str, "Ambient Sound Control"))
+    {
+        return MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_AMBIENT_SOUND_CONTROL;
+    }
+    else if (g_str_equal(str, "Volume Control"))
+    {
+        return MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_VOLUME_CONTROL;
+    }
+    else if (g_str_equal(str, "Playback Control"))
+    {
+        return MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_PLAYBACK_CONTROL;
+    }
+    else if (g_str_equal(str, "Voice Recognition"))
+    {
+        return MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_VOICE_RECOGNITION;
+    }
+    else if (g_str_equal(str, "Google Assistant"))
+    {
+        return MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_GOOGLE_ASSISTANT;
+    }
+    else if (g_str_equal(str, "Amazon Alexa"))
+    {
+        return MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_AMAZON_ALEXA;
+    }
+    else if (g_str_equal(str, "Tencent Xiaowei"))
+    {
+        return MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_TENCENT_XIAOWEI;
+    }
+    else if (g_str_equal(str, "No Function"))
+    {
+        return MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_NO_FUNCTION;
+    }
+    else
+    {
+        return MDR_PACKET_SYSTEM_ASSIGNABLE_SETTINGS_PRESET_NO_FUNCTION;
+    }
+}
+
+static void device_init_key_functions_error(void* user_data)
+{
+    device_t* device = user_data;
+
+    g_warning("Device init key functions failed (3): %d", errno);
+
+    if (device->key_functions_iface != NULL)
+    {
+        g_object_unref(device->key_functions_iface);
+        device->key_functions_iface = NULL;
+    }
+
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_init_playback_result(
+        uint8_t volume,
+        void* user_data);
+
+static void device_init_playback_error(void* user_data);
+
+static void device_init_playback(device_t* device)
+{
+    if (mdr_device_playback_get_volume(
+            device->mdr_device,
+            device_init_playback_result,
+            device_init_playback_error,
+            device) < 0)
+    {
+        g_warning("Device init playback failed (1): %d", errno);
+    }
+    else
+    {
+        device_start_registration(device);
+        device_ref(device);
+    }
+}
+
+static gboolean device_playback_set_volume(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        const guint volume,
+        gpointer user_data);
+
+static void device_playback_volume_update(
+        uint8_t volume,
+        void* user_data);
+
+static void device_init_playback_result(
+        uint8_t volume,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    device->playback_iface = org_mdr_playback_skeleton_new();
+
+    g_signal_connect(device->playback_iface,
+                     "handle-set-volume",
+                     G_CALLBACK(device_playback_set_volume),
+                     device);
+
+    GError* error = NULL;
+
+    if (g_dbus_interface_skeleton_export(
+                G_DBUS_INTERFACE_SKELETON(device->playback_iface),
+                connection,
+                device->dbus_name,
+                &error))
+    {
+        org_mdr_playback_set_volume(device->playback_iface, volume);
+
+        g_debug("Registered playback interface for '%s'", device->dbus_name);
+
+        mdr_device_playback_subscribe_volume(
+                device->mdr_device,
+                device_playback_volume_update,
+                device);
+    }
+    else
+    {
+        device->auto_power_off_iface = NULL;
+
+        g_warning("Failed to register playback interface (5): "
+                  "%s", error->message);
+    }
+
+    device_finish_registration(device);
+    device_unref(device);
+}
+
+static void device_playback_set_volume_success(void* user_data);
+
+static void device_playback_set_volume_error(void* user_data);
+
+static gboolean device_playback_set_volume(
+        OrgMdrNoiseCancelling* interface,
+        GDBusMethodInvocation* invocation,
+        const guint volume,
+        gpointer user_data)
+{
+    device_t* device = user_data;
+
+    mdr_device_playback_set_volume(
+            device->mdr_device,
+            volume,
+            device_playback_set_volume_success,
+            device_playback_set_volume_error,
+            invocation);
+
+    return TRUE;
+}
+
+static void device_playback_set_volume_success(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_value(invocation, NULL);
+}
+
+static void device_playback_set_volume_error(void* user_data)
+{
+    GDBusMethodInvocation* invocation = user_data;
+
+    g_dbus_method_invocation_return_dbus_error(
+            invocation,
+            "org.mdr.DeviceError",
+            "Call failed.");
+}
+
+static void device_playback_volume_update(
+        uint8_t volume,
+        void* user_data)
+{
+    device_t* device = user_data;
+
+    if (device->playback_iface)
+    {
+        org_mdr_playback_set_volume(device->playback_iface, volume);
+    }
+}
+
+static void device_init_playback_error(void* user_data)
+{
+    device_t* device = user_data;
+
+    device->auto_power_off_iface = NULL;
+    g_warning("Device init playback failed (4): %d", errno);
 
     device_finish_registration(device);
     device_unref(device);
@@ -1901,6 +2601,22 @@ static void device_unref(device_t* device)
                     G_DBUS_INTERFACE_SKELETON(device->auto_power_off_iface),
                     connection);
             g_object_unref(device->auto_power_off_iface);
+        }
+
+        if (device->key_functions_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->key_functions_iface),
+                    connection);
+            g_object_unref(device->key_functions_iface);
+        }
+
+        if (device->playback_iface != NULL)
+        {
+            g_dbus_interface_skeleton_unexport_from_connection(
+                    G_DBUS_INTERFACE_SKELETON(device->playback_iface),
+                    connection);
+            g_object_unref(device->playback_iface);
         }
     }
 }

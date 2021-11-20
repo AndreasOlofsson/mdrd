@@ -59,7 +59,7 @@ $(LIBMDR): .FORCE $(LIBMDR_DIR)
 	cd $(LIBMDR_DIR) && make
 
 $(LIBMDR_DIR):
-	git clone -b 'v0.2' --depth 1 https://github.com/AndreasOlofsson/libmdr
+	git clone -b 'v0.5' --depth 1 https://github.com/AndreasOlofsson/libmdr
 
 .PRECIOUS: $(GENERATED_INTERFACE_HEADERS)
 

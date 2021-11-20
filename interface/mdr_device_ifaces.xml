@@ -87,4 +87,18 @@ along with mdrd. If not, see <https://www.gnu.org/licenses/>.
             <arg name="timeout" type="s" direction="in"/>
         </method>
     </interface>
+    <interface name="org.mdr.KeyFunctions">
+        <property name="available_presets" type="a{s(ssa{sa{ss}})}" access="read"/>
+        <property name="current_presets" type="a{ss}" access="read"/>
+
+        <method name="SetPresets">
+            <arg name="presets" type="a{ss}" direction="in"/>
+        </method>
+    </interface>
+    <interface name="org.mdr.Playback">
+        <property name="volume" type="u" access="read"/>
+        <method name="SetVolume">
+            <arg name="volume" type="u" direction="in"/>
+        </method>
+    </interface>
 </node>
